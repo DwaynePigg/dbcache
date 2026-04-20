@@ -16,18 +16,18 @@ from types import NoneType
 _UNSET = object()
 
 
-def database_cache(file, max_age=None, max_size=None, evict_batch=None):
+def database_cache(file, name=None, max_age=None, max_size=None, evict_batch=None):
 	if max_age is None and max_size is None:
-		return lambda func: SimpleCache(func, file)
-	return lambda func: TimestampCache(func, file, max_age, max_size, evict_batch)
+		return lambda func: SimpleCache(func, file, name)
+	return lambda func: TimestampCache(func, file, name, max_age, max_size, evict_batch)
 
 
 class Cache(ABC):
 
-	def __init__(self, func, file, *, timestamp=False):
+	def __init__(self, func, file, name, *, timestamp=False):
 		self.func = func
 		self.conn = sqlite3.connect(file)
-		self.table = func.__name__
+		self.table = name or func.__name__
 		functools.update_wrapper(self, func)
 		sig = inspect.signature(func)
 		input_columns = [Column(name, param.annotation) for name, param in sig.parameters.items()]
@@ -132,8 +132,8 @@ class SimpleCache(Cache):
 
 class TimestampCache(Cache):
 
-	def __init__(self, func, file, max_age=None, max_size=None, evict_batch=None):
-		super().__init__(func, file, timestamp=True)
+	def __init__(self, func, file, name, max_age=None, max_size=None, evict_batch=None):
+		super().__init__(func, file, name, timestamp=True)
 		self.max_age = get_age(max_age)
 		if self.max_age < 1:
 			raise ValueError(f"{max_age=}")
@@ -224,9 +224,14 @@ class Column:
 			raise ValueError(f"type of {name} must be given")
 		if typing.get_origin(tp) is typing.Annotated:
 			_base, meta = typing.get_args(tp)
-			if len(meta) != 2:
-				raise ValueError(f"type annotation must be an tuple of (serializer, deserializer) but got {meta}")
-			self.serialize , self.deserialize = meta
+			if callable(meta):
+				self.serialize = meta
+				self.deserialize = identity
+			elif len(meta) == 2 and all(callable(f) for f in meta):
+				self.serialize , self.deserialize = meta
+			else:
+				raise ValueError(
+					f"type annotation must be a serializer function or a tuple of (serializer, deserializer) but got {meta}")
 			try:
 				tp = self.serialize.__annotations__['return']
 			except KeyError:
