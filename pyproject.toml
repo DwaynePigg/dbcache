@@ -1,0 +1,9 @@
+[project]
+name = "database-cache"
+version = "0.1.0"
+description = "SQLite-backed function cache decorator"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
