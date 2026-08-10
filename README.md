@@ -76,6 +76,10 @@ and `.close()`.
 
 ## Caveats
 
+- Every parameter maps to one column, so `*args` and `**kwargs` cannot be cached.
+  Keyword-only and positional-only parameters are fine. Call spelling does not
+  matter: `f(1, 2)`, `f(1, b=2)` and `f(b=2, a=1)` are bound through the
+  signature and share one cache entry.
 - Not thread-safe: the SQLite connection is created with the default
   `check_same_thread=True` and belongs to the thread that applied the decorator.
 - Methods are not supported — `self` has no annotation.

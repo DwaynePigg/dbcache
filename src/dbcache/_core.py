@@ -54,6 +54,20 @@ class Cache(ABC):
 		if clashing:
 			raise ValueError(f"{self.table} has parameter(s) {clashing} reserved by the cache; rename them")
 
+		# FIX: a row has fixed arity, a variadic parameter does not. One column
+		# was reserved for it and the bound tuple/dict then went straight to
+		# sqlite3, so these decorated cleanly and failed at call time with an
+		# opaque "Error binding parameter N: type 'tuple' is not supported".
+		# Reject the shape up front. (Keyword-only and positional-only
+		# parameters are fine: both have fixed arity and bind normally.)
+		variadic = [
+			p.name for p in sig.parameters.values()
+			if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)]
+		if variadic:
+			raise ValueError(
+				f"{self.table} has variadic parameter(s) {variadic}; every parameter must map to "
+				f"one fixed column, so *args and **kwargs cannot be cached")
+
 		# FIX: annotations were read straight off __annotations__, so a caller
 		# module using `from __future__ import annotations` (which turns every
 		# annotation into a string) failed with "unsupported type: 'int'".

@@ -232,6 +232,45 @@ def test_defaults_are_applied(db):
 	assert len(f.contents()) == 1
 
 
+def test_keyword_only_parameter(db):
+	"""REGRESSION: a keyword-only parameter decorated fine but was uncallable by
+	any spelling -- both f(1, b=2) and f(1, 2) raised TypeError."""
+	@database_cache(db)
+	def f(a: int, *, b: int) -> int:
+		return a + b
+
+	assert f(1, b=2) == 3
+	assert f(1, b=2) == 3  # cache hit
+	assert len(f.contents()) == 1
+
+
+def test_positional_only_parameter(db):
+	@database_cache(db)
+	def f(a: int, /, b: int) -> int:
+		return a + b
+
+	assert f(1, 2) == 3
+	assert f(1, b=2) == 3
+	assert len(f.contents()) == 1  # both spellings are one key
+
+
+def test_var_positional_rejected(db):
+	"""REGRESSION: *args has no fixed arity, so this decorated cleanly and then
+	failed at call time with `type 'tuple' is not supported`."""
+	with pytest.raises(ValueError, match="variadic"):
+		@database_cache(db)
+		def f(*xs: int) -> int:
+			return sum(xs)
+
+
+def test_var_keyword_rejected(db):
+	"""REGRESSION: as above, failing with `type 'dict' is not supported`."""
+	with pytest.raises(ValueError, match="variadic"):
+		@database_cache(db)
+		def f(a: int, **kw: int) -> int:
+			return a
+
+
 def test_reserved_parameter_names_rejected(db):
 	"""REGRESSION: a parameter named max_age/cache/cache_only was silently
 	swallowed as a control flag now that **kwargs are forwarded."""
