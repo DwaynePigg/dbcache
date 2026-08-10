@@ -93,3 +93,13 @@ pytest
 ```
 
 Tested on CPython 3.10, 3.11 and 3.13.
+
+The package directory sits at the repo root, so `import dbcache` from here resolves
+to the working tree and shadows whatever is installed. That is convenient day to
+day, but it means the test run above cannot catch a packaging mistake. Before
+cutting a release, check the built artifact from somewhere else:
+
+```
+python -m build --wheel && pip install dist/*.whl && cd /tmp && pytest path/to/tests
+```
+

@@ -24,10 +24,11 @@ test = ["pytest"]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
-# Explicit src layout. The old setup relied on flat-layout auto-discovery, which
-# is what silently dropped __init__.py from the wheel.
+# Flat layout, declared explicitly rather than left to auto-discovery -- guessing
+# wrong is what silently dropped __init__.py from the wheel before.
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["dbcache*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
