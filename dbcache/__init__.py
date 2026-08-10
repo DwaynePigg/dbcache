@@ -1,7 +1,4 @@
-"""SQLite-backed function cache decorator.
-
-The public API is exactly these two names; the implementation lives in _core.
-"""
+"""SQLite-backed function cache decorator."""
 
 from ._core import database_cache, CacheMiss
 

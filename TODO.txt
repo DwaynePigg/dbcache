@@ -1,0 +1,32 @@
+I actually don't care about supporting Python 3.10/3.11 (Not sure why that was in the toml), so let's get rid of that and use f-strings with nested double quotes where it makes sense.
+Why are quotes escaped? They can't appear in a function name
+
+Let's get rid of qtable, just use escaped version
+
+do I care about __future__?
+
+primary keys being nullable: good fix
+inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD: good fix
+
+report how signature changed
+
+# FIX: eviction was `DELETE ... WHERE timestamp <= (nth oldest timestamp)`.
+# Timestamps are whole seconds, so entries written in the same second tie
+# and `<=` swept up every one of them -- a single eviction emptied the
+# whole table. (It was also off by one even with distinct timestamps,
+# since OFFSET n lands on the n+1'th row and `<=` includes it.) Delete
+# exactly `count` rows addressed by primary key, ordering by the key as a
+# tiebreak so the choice is deterministic when timestamps are equal.
+
+--Isn't this less efficient because you have to do two queries? And deleting extra entries that are less than a second away from becoming invalid doesn't feel like a terrible side effect
+
+Then we end up doing this:
+
+# FIX: the table is WITHOUT ROWID keyed on the inputs, so the eviction
+# subquery's ORDER BY timestamp meant a full scan and sort every time.
+
+Which we don't need to do!
+
+int(0.2 * max_size): better system?
+
+What do you think of the overall organization of Cache(ABC)/SimpleCache/TimestampCache?
