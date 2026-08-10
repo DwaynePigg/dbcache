@@ -1,9 +1,33 @@
 [project]
-name = "database-cache"
+# Renamed from "database-cache" so the distribution name matches the import name
+# and the repo. Change it back if "dbcache" turns out to be taken on PyPI.
+name = "dbcache"
 version = "0.1.0"
 description = "SQLite-backed function cache decorator"
+readme = "README.md"
+# Was ">=3.10", but the module used PEP 701 f-string nesting and would not parse
+# before 3.12. The syntax is fixed, so 3.10 is now genuine -- and tested.
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+
+# TODO: add authors, license and [project.urls] before publishing -- left out
+# rather than guessed at.
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+# Explicit src layout. The old setup relied on flat-layout auto-discovery, which
+# is what silently dropped __init__.py from the wheel.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

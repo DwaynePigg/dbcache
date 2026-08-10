@@ -1,2 +1,5 @@
 __pycache__/
-database_cache.egg-info/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
