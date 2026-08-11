@@ -8,7 +8,7 @@ do I care about __future__?
 primary keys being nullable: good fix
 inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD: good fix
 
-report how signature changed
+When you said:
 
 # FIX: eviction was `DELETE ... WHERE timestamp <= (nth oldest timestamp)`.
 # Timestamps are whole seconds, so entries written in the same second tie
@@ -18,7 +18,7 @@ report how signature changed
 # exactly `count` rows addressed by primary key, ordering by the key as a
 # tiebreak so the choice is deterministic when timestamps are equal.
 
---Isn't this less efficient because you have to do two queries? And deleting extra entries that are less than a second away from becoming invalid doesn't feel like a terrible side effect
+Isn't this less efficient because you have to do two queries? And deleting extra entries that are less than a second away from becoming invalid doesn't feel like a terrible side effect.
 
 Then we end up doing this:
 
@@ -30,3 +30,7 @@ Which we don't need to do!
 int(0.2 * max_size): better system?
 
 What do you think of the overall organization of Cache(ABC)/SimpleCache/TimestampCache?
+
+
+
+report how signature changed
