@@ -12,7 +12,9 @@ from typing import Annotated
 import pytest
 
 from dbcache import CacheMiss, database_cache
-from dbcache._core import Cache, max_local, record_size, serial_type
+from dbcache._core import (
+	Cache, DataclassCodec, ScalarCodec, TupleCodec,
+	build_codec, max_local, record_size, serial_type)
 
 
 @pytest.fixture
@@ -160,6 +162,35 @@ def test_record_size_matches_sqlite_serial_types():
 	assert serial_type('abc') == (19, 3)
 	# 2 one-byte columns + 1 header-length byte
 	assert record_size([200, 200]) == 3 + 4
+
+
+def test_build_codec_round_trips_without_a_database():
+	"""The point of the extraction: return-type handling is now reachable
+	without a connection, a table, or any SQL."""
+	@dataclass
+	class P:
+		a: int
+		b: str
+
+	for return_type, value in ((int, 7), (tuple[int, str], (7, 'x')), (P, P(7, 'x'))):
+		codec = build_codec(return_type)
+		row = []
+		codec.concat(row, value)
+		assert len(row) == len(codec.columns)
+		assert codec.compose(row) == value
+
+
+def test_build_codec_dispatch():
+	@dataclass
+	class P:
+		a: int
+		b: str
+
+	assert type(build_codec(int)) is ScalarCodec
+	assert type(build_codec(tuple[int, str])) is TupleCodec
+	assert type(build_codec(P)) is DataclassCodec
+	# the specialisation is real, not just a naming convention
+	assert isinstance(build_codec(P), TupleCodec)
 
 
 def test_max_local_formulas():
@@ -451,7 +482,7 @@ def test_var_keyword_rejected(db):
 
 
 def test_reserved_parameter_names_rejected(db):
-	"""REGRESSION: a parameter named max_age/cache/cache_only was silently
+	"""REGRESSION: a parameter named max_age/refresh/cache_only was silently
 	swallowed as a control flag now that **kwargs are forwarded."""
 	with pytest.raises(ValueError, match="reserved"):
 		@database_cache(db, max_age=60)
@@ -576,18 +607,18 @@ def test_cache_only_raises_on_miss(db):
 	assert f(1, cache_only=True) == 1
 
 
-def test_cache_only_with_cache_false_is_rejected(db):
+def test_refresh_with_cache_only_is_rejected(db):
 	"""REGRESSION: this combination silently called the function, the exact
 	opposite of what cache_only asks for."""
 	@database_cache(db)
 	def f(x: int) -> int:
 		return x
 
-	with pytest.raises(ValueError, match="meaningless"):
-		f(1, cache=False, cache_only=True)
+	with pytest.raises(ValueError, match="contradictory"):
+		f(1, refresh=True, cache_only=True)
 
 
-def test_cache_false_refreshes(db):
+def test_refresh_recomputes(db):
 	calls = []
 
 	@database_cache(db)
@@ -598,8 +629,44 @@ def test_cache_false_refreshes(db):
 	f(1)
 	f(1)
 	assert calls == [1]
-	f(1, cache=False)
+	f(1, refresh=True)
 	assert calls == [1, 1]
+
+
+def test_explicit_refresh_does_not_grow_size(db):
+	"""refresh skips the freshness check but not the lookup: `cached_output is
+	None` is what tells the size accounting a write adds a row rather than
+	replacing one, so skipping it would count every refresh as growth."""
+	@database_cache(db, max_size=10)
+	def f(x: int) -> int:
+		return x
+
+	f(1)
+	assert f.size == 1
+	f(1, refresh=True)
+	assert f.size == 1
+	assert len(f.contents()) == 1
+
+
+def test_control_flags_are_uniform_across_cache_types(tmp_path):
+	"""The point of `refresh`: which subclass database_cache picks is a
+	decoration-time detail, so the per-call API must not depend on it."""
+	@database_cache(tmp_path / "a.db")
+	def simple(x: int) -> int:
+		return x
+
+	@database_cache(tmp_path / "b.db", max_age=60)
+	def timed(x: int) -> int:
+		return x
+
+	for f in (simple, timed):
+		with pytest.raises(CacheMiss):
+			f(1, cache_only=True)
+		assert f(1) == 1
+		assert f(1, cache_only=True) == 1
+		assert f(1, refresh=True) == 1
+		with pytest.raises(ValueError, match="contradictory"):
+			f(1, refresh=True, cache_only=True)
 
 
 def test_expired_entry_is_refreshed(db):

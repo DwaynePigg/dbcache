@@ -54,14 +54,18 @@ costing you.
 
 ## Per-call flags
 
-`cache`, `cache_only` and `max_age` are reserved keyword arguments; a wrapped
+`refresh`, `cache_only` and `max_age` are reserved keyword arguments; a wrapped
 function may not use those parameter names.
 
 ```python
+slow(42, refresh=True)       # ignore any cached entry, recompute and store
+slow(42, cache_only=True)    # raise CacheMiss rather than calling through
 fetch(url, max_age=60)       # accept an entry only if it is under a minute old
-fetch(url, cache_only=True)  # raise CacheMiss rather than calling through
-slow(42, cache=False)        # skip the lookup, recompute and overwrite
 ```
+
+`refresh` and `cache_only` work on every cache, so which of them you reach for
+never depends on how the cache was created. `max_age` is the exception: it needs
+a cache created with `max_age` or `max_size`, since only those store a timestamp.
 
 ## Supported types
 

@@ -1,9 +1,3 @@
 Let's get rid of qtable, just use escaped version
 
 do I care about __future__?
-
-
-What do you think of the overall organization of Cache(ABC)/SimpleCache/TimestampCache?
-
-
-report how signature changed

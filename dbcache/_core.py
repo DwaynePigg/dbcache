@@ -20,13 +20,92 @@ _EMPTY = inspect.Parameter.empty
 # produce a wrong cache key. Reject it loudly at decoration time instead. All
 # three names are reserved by both subclasses so that a function does not become
 # un-wrappable just by switching between SimpleCache and TimestampCache.
-_CONTROL_KEYWORDS = frozenset({'cache', 'cache_only', 'max_age'})
+_CONTROL_KEYWORDS = frozenset({'refresh', 'cache_only', 'max_age'})
 
 
 def database_cache(file, name=None, max_age=None, max_size=None, evict_batch=None, rowid=False):
 	if max_age is None and max_size is None:
 		return lambda func: SimpleCache(func, file, name, rowid=rowid)
 	return lambda func: TimestampCache(func, file, name, max_age, max_size, evict_batch, rowid=rowid)
+
+
+class Codec(ABC):
+	"""Maps a return value onto output columns and back.
+
+	Which subclass applies is settled once, by build_codec at decoration time,
+	so no branching on the return shape survives into the call path.
+	"""
+
+	def __init__(self, columns):
+		self.columns = columns
+
+	@abstractmethod
+	def concat(self, row, value):
+		"""Append `value`, serialized, onto a row being assembled."""
+
+	@abstractmethod
+	def compose(self, values):
+		"""Rebuild the return value from the columns read back."""
+
+
+class ScalarCodec(Codec):
+	"""A single `return` column holding the value itself."""
+
+	def __init__(self, column):
+		super().__init__([column])
+		self.column = column
+
+	def concat(self, row, value):
+		row.append(self.column.serialize(value))
+
+	def compose(self, values):
+		(value,) = values
+		return self.column.deserialize(value)
+
+
+class TupleCodec(Codec):
+	"""One column per element, named `return$0` upward."""
+
+	def concat(self, row, value):
+		row.extend(col.serialize(v) for col, v in zip(self.columns, value, strict=True))
+
+	def compose(self, values):
+		return tuple(col.deserialize(v) for col, v in zip(self.columns, values, strict=True))
+
+
+class DataclassCodec(TupleCodec):
+	"""Tuple-shaped once serialized; only the two ends differ."""
+
+	def __init__(self, columns, return_type):
+		super().__init__(columns)
+		self.return_type = return_type
+
+	def concat(self, row, value):
+		super().concat(row, astuple(value))
+
+	def compose(self, values):
+		return self.return_type(*super().compose(values))
+
+
+def build_codec(return_type):
+	"""Choose the Codec for a return annotation."""
+	if return_type is tuple:
+		raise ValueError('tuple return type must be parameterized')
+
+	if is_dataclass(return_type):
+		# FIX: field.type is whatever was written in the class body, which is a
+		# string under `from __future__ import annotations`. Resolve the
+		# dataclass's hints too, then index them in declared field order.
+		hints = typing.get_type_hints(return_type, include_extras=True)
+		return DataclassCodec(
+			[Column(f"return${i}", hints[f.name]) for i, f in enumerate(fields(return_type))],
+			return_type)
+
+	if typing.get_origin(return_type) is tuple:
+		return TupleCodec(
+			[Column(f"return${i}", a) for i, a in enumerate(typing.get_args(return_type))])
+
+	return ScalarCodec(Column("return", return_type))
 
 
 def quote(identifier):
@@ -101,38 +180,8 @@ class Cache(ABC):
 		except KeyError:
 			raise ValueError('return type must be given')
 
-		if return_type is tuple:
-			raise ValueError('tuple return type must be parameterized')
-
-		if is_dataclass(return_type):
-			# FIX: field.type is whatever was written in the class body, which is
-			# a string under `from __future__ import annotations`. Resolve the
-			# dataclass's hints too, then index them in declared field order.
-			field_hints = typing.get_type_hints(return_type, include_extras=True)
-			output_columns = [Column(f"return${i}", field_hints[f.name]) for i, f in enumerate(fields(return_type))]
-			def concat(row, dc):
-				row.extend(col.serialize(val) for col, val in zip(output_columns, astuple(dc)))
-
-			def compose(values):
-				return return_type(*(col.deserialize(val) for col, val in zip(output_columns, values)))
-
-		elif typing.get_origin(return_type) is tuple:
-			output_columns = [Column(f"return${i}", a) for i, a in enumerate(typing.get_args(return_type))]
-			def concat(row, values):
-				row.extend(col.serialize(val) for col, val in zip(output_columns, values, strict=True))
-
-			def compose(values):
-				return tuple(col.deserialize(val) for col, val in zip(output_columns, values, strict=True))
-
-		else:
-			only_return_column = Column(f"return", return_type)
-			output_columns = [only_return_column]
-			def concat(row, only):
-				row.append(only_return_column.serialize(only))
-
-			def compose(values):
-				(only,) = values
-				return only_return_column.deserialize(only)
+		codec = build_codec(return_type)
+		output_columns = codec.columns
 
 		# Whole seconds. Eviction gets its exactness from LIMIT capping the row
 		# count (see evict_cmd), not from timestamps being unique, so sub-second
@@ -175,8 +224,7 @@ class Cache(ABC):
 		self.signature = sig
 		self.input_columns = input_columns
 		self.columns = columns
-		self.concat = concat
-		self.compose = compose
+		self.codec = codec
 
 	@abstractmethod
 	def __call__(self, *args, **kwargs):
@@ -255,22 +303,22 @@ class Cache(ABC):
 
 class SimpleCache(Cache):
 
-	def __call__(self, *args, cache=True, cache_only=False, **kwargs):
+	def __call__(self, *args, refresh=False, cache_only=False, **kwargs):
 		# FIX: this combination used to skip the lookup and call the function,
 		# the exact opposite of what cache_only asks for.
-		if cache_only and not cache:
-			raise ValueError('cache_only=True is meaningless with cache=False')
+		if refresh and cache_only:
+			raise ValueError('refresh=True and cache_only=True are contradictory')
 
 		values = self.serialize_input(args, kwargs)
-		if cache:
+		if not refresh:
 			cached_output = self.get_cached(values)
 			if cached_output is not None:
-				return self.compose(cached_output)
+				return self.codec.compose(cached_output)
 			if cache_only:
 				raise CacheMiss(args, kwargs)
 
 		result = self.func(*args, **kwargs)
-		self.concat(values, result)
+		self.codec.concat(values, result)
 		self.conn.execute(self.insert_cmd, values)
 		self.conn.commit()
 		return result
@@ -326,21 +374,27 @@ class TimestampCache(Cache):
 				self.evict(self.size - max_size)
 				self.vacuum()
 
-	def __call__(self, *args, max_age=_UNSET, cache_only=False, **kwargs):
+	def __call__(self, *args, refresh=False, max_age=_UNSET, cache_only=False, **kwargs):
+		if refresh and cache_only:
+			raise ValueError('refresh=True and cache_only=True are contradictory')
+
 		values = self.serialize_input(args, kwargs)
+		# The lookup still runs under refresh: `cached_output is None` is what
+		# tells the size accounting below whether the write adds a row or
+		# replaces one, and skipping it would count every refresh as growth.
 		cached_output = self.get_cached(values)
-		if cached_output is not None:
+		if cached_output is not None and not refresh:
 			*return_values, timestamp = cached_output
 			max_age = self.max_age if max_age is _UNSET else get_age(max_age)
 			# FIX: get_age was applied a second time to an already-converted value.
 			if time.time() - timestamp <= max_age:
-				return self.compose(return_values)
+				return self.codec.compose(return_values)
 
 		if cache_only:
 			raise CacheMiss(args, kwargs)
 
 		result = self.func(*args, **kwargs)
-		self.concat(values, result)
+		self.codec.concat(values, result)
 		values.append(int(time.time()))
 		self.conn.execute(self.insert_cmd, values)
 		if cached_output is None:
