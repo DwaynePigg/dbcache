@@ -122,6 +122,14 @@ file to rebuild.
 The decorated function is a `Cache`, with `.clear()`, `.vacuum()`, `.contents()`
 and `.close()`.
 
+You will not normally call `.close()`. Writes are committed as they happen, so
+nothing is pending at exit and the interpreter closes the connection for you —
+a cache decorated at import and left open for the life of the process is the
+intended usage. It matters when something needs the file itself, since deleting
+or replacing a cache fails on Windows while a connection is open, and when
+caches are created dynamically rather than once at import. It is terminal:
+calling the function afterwards raises `ProgrammingError`.
+
 `.stats()` reports how rows are actually sitting on disk, which is otherwise
 invisible — a cache that has fallen off the overflow cliff looks completely
 normal from the outside:

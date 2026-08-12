@@ -133,6 +133,10 @@ class Cache(ABC):
 		# DQS off makes quoted tokens strictly identifiers. (Python 3.12+.)
 		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
 		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+		# Both forms are load-bearing. qtable is interpolated into SQL; the raw
+		# name goes to sqlite_master and pragma_table_info, which take an
+		# identifier as a *bound parameter* and store it unquoted -- passing the
+		# quoted form there matches nothing, silently, rather than erroring.
 		self.table = name or func.__name__
 		self.qtable = quote(self.table)
 		functools.update_wrapper(self, func)
@@ -437,6 +441,108 @@ def column_names(columns):
 	return ', '.join(col.quoted for col in columns)
 
 
+def identity(x):
+	return x
+
+
+def to_bool(value):
+	# None passes through so a nullable bool column round-trips as None, not False.
+	return value if value is None else bool(value)
+
+
+SQLITE_TYPES = {
+	bool: 'INTEGER',
+	int: 'INTEGER',
+	float: 'REAL',
+	str: 'TEXT',
+	bytes: 'BLOB',
+	bytearray: 'BLOB',
+}
+
+
+class Column:
+
+	def __init__(self, name: str, tp: type):
+		self.name = name
+		self.quoted = quote(name)
+		if tp is _EMPTY:
+			raise ValueError(f"type of {name} must be given")
+		if typing.get_origin(tp) is typing.Annotated:
+			# FIX: get_args was unpacked as exactly two values, so Annotated with
+			# more than one piece of metadata died on an opaque tuple-unpack
+			# error instead of the intended message.
+			_base, *extras = typing.get_args(tp)
+			if len(extras) != 1:
+				raise ValueError(f"expected a single serializer annotation on {name} but got {extras}")
+			meta = extras[0]
+			if callable(meta):
+				self.serialize = meta
+				self.deserialize = identity
+			# FIX: len(meta) raised TypeError for un-sized metadata (an int, say)
+			# instead of falling through to the ValueError below.
+			elif isinstance(meta, tuple) and len(meta) == 2 and all(callable(f) for f in meta):
+				self.serialize, self.deserialize = meta
+			else:
+				raise ValueError(
+					f"type annotation must be a serializer function or a tuple of (serializer, deserializer) but got {meta}")
+			try:
+				# FIX: read through get_type_hints for the same reason as above,
+				# and tolerate callables that have no __annotations__ at all.
+				tp = typing.get_type_hints(self.serialize)['return']
+			except (KeyError, TypeError, AttributeError):
+				raise ValueError('serializer must have return type')
+		else:
+			self.serialize = identity
+			self.deserialize = identity
+
+		origin = typing.get_origin(tp)
+		if origin is types.UnionType or origin is typing.Union:
+			self.base_type = unwrap_union(tp)
+			self.nullable = True
+		else:
+			self.base_type = tp
+			self.nullable = False
+
+		try:
+			self.sql_type = SQLITE_TYPES[self.base_type]
+		except KeyError:
+			raise ValueError(f"unsupported type: {tp}")
+
+		# FIX: bool stored as INTEGER came back as 0/1, so a cache hit returned
+		# int where the fresh call returned bool. Only applied when the caller
+		# has not supplied a deserializer of their own.
+		if self.base_type is bool and self.deserialize is identity:
+			self.deserialize = to_bool
+
+	@property
+	def definition(self):
+		return f"{self.quoted} {self.sql_type}{"" if self.nullable else " NOT NULL"}"
+
+	def __repr__(self):
+		# FIX: __name__ is missing on partials and callable objects.
+		def label(f):
+			return getattr(f, '__name__', repr(f))
+		return f"({self.definition}: >>{label(self.serialize)}, <<{label(self.deserialize)})"
+
+
+def unwrap_union(tp: type) -> type:
+	args = typing.get_args(tp)
+	if len(args) == 2:
+		if args[1] is NoneType:
+			return args[0]
+		if args[0] is NoneType:
+			return args[1]
+	raise ValueError(f"Union not allowed except to express nullable type: {tp}")
+
+
+def get_age(age):
+	if age is None:
+		return sys.maxsize
+	if isinstance(age, timedelta):
+		return age.total_seconds()
+	return age
+
+
 def max_local(page_size, rowid):
 	"""Largest record that still fits inside a page, past which rows overflow.
 
@@ -539,105 +645,3 @@ class CacheStats:
 		else:
 			lines.append(f"  headroom    {self.headroom} bytes before rows start overflowing")
 		return "\n".join(lines)
-
-
-def identity(x):
-	return x
-
-
-def to_bool(value):
-	# None passes through so a nullable bool column round-trips as None, not False.
-	return value if value is None else bool(value)
-
-
-SQLITE_TYPES = {
-	bool: 'INTEGER',
-	int: 'INTEGER',
-	float: 'REAL',
-	str: 'TEXT',
-	bytes: 'BLOB',
-	bytearray: 'BLOB',
-}
-
-
-class Column:
-
-	def __init__(self, name: str, tp: type):
-		self.name = name
-		self.quoted = quote(name)
-		if tp is _EMPTY:
-			raise ValueError(f"type of {name} must be given")
-		if typing.get_origin(tp) is typing.Annotated:
-			# FIX: get_args was unpacked as exactly two values, so Annotated with
-			# more than one piece of metadata died on an opaque tuple-unpack
-			# error instead of the intended message.
-			_base, *extras = typing.get_args(tp)
-			if len(extras) != 1:
-				raise ValueError(f"expected a single serializer annotation on {name} but got {extras}")
-			meta = extras[0]
-			if callable(meta):
-				self.serialize = meta
-				self.deserialize = identity
-			# FIX: len(meta) raised TypeError for un-sized metadata (an int, say)
-			# instead of falling through to the ValueError below.
-			elif isinstance(meta, tuple) and len(meta) == 2 and all(callable(f) for f in meta):
-				self.serialize, self.deserialize = meta
-			else:
-				raise ValueError(
-					f"type annotation must be a serializer function or a tuple of (serializer, deserializer) but got {meta}")
-			try:
-				# FIX: read through get_type_hints for the same reason as above,
-				# and tolerate callables that have no __annotations__ at all.
-				tp = typing.get_type_hints(self.serialize)['return']
-			except (KeyError, TypeError, AttributeError):
-				raise ValueError('serializer must have return type')
-		else:
-			self.serialize = identity
-			self.deserialize = identity
-
-		origin = typing.get_origin(tp)
-		if origin is types.UnionType or origin is typing.Union:
-			self.base_type = unwrap_union(tp)
-			self.nullable = True
-		else:
-			self.base_type = tp
-			self.nullable = False
-
-		try:
-			self.sql_type = SQLITE_TYPES[self.base_type]
-		except KeyError:
-			raise ValueError(f"unsupported type: {tp}")
-
-		# FIX: bool stored as INTEGER came back as 0/1, so a cache hit returned
-		# int where the fresh call returned bool. Only applied when the caller
-		# has not supplied a deserializer of their own.
-		if self.base_type is bool and self.deserialize is identity:
-			self.deserialize = to_bool
-
-	@property
-	def definition(self):
-		return f"{self.quoted} {self.sql_type}{"" if self.nullable else " NOT NULL"}"
-
-	def __repr__(self):
-		# FIX: __name__ is missing on partials and callable objects.
-		def label(f):
-			return getattr(f, '__name__', repr(f))
-		return f"({self.definition}: >>{label(self.serialize)}, <<{label(self.deserialize)})"
-
-
-def unwrap_union(tp: type) -> type:
-	args = typing.get_args(tp)
-	if len(args) == 2:
-		if args[1] is NoneType:
-			return args[0]
-		if args[0] is NoneType:
-			return args[1]
-	raise ValueError(f"Union not allowed except to express nullable type: {tp}")
-
-
-def get_age(age):
-	if age is None:
-		return sys.maxsize
-	if isinstance(age, timedelta):
-		return age.total_seconds()
-	return age
