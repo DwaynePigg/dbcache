@@ -199,7 +199,12 @@ class Cache(ABC):
 			# hiding "database is locked", disk I/O errors and the like. Only a
 			# missing table or column actually implies the signature moved.
 			if str(e).startswith(('no such table', 'no such column')):
-				raise ValueError(f"{self.table} function signature has changed incompatibly") from e
+				cached = self.conn.execute(
+					'SELECT name, type FROM pragma_table_info(?)', (self.table,)).fetchall()
+				raise ValueError(
+					f"{self.table} function signature has changed incompatibly\n"
+					f"  cached: {', '.join(f'{n} {t}' for n, t in cached) or '(table is missing)'}\n"
+					f"  wanted: {', '.join(f'{c.name} {c.sql_type}' for c in self.columns)}") from e
 			raise
 
 	def clear(self):
@@ -303,9 +308,17 @@ class TimestampCache(Cache):
 			self.evict_batch = None
 		else:
 			self.max_size = max_size
-			# FIX: int(0.2 * max_size) is 0 for max_size < 5, so eviction deleted
-			# nothing and the cache stayed permanently over its limit.
-			self.evict_batch = evict_batch or max(1, int(0.2 * max_size))
+			# 5% of max_size. Eviction pays for an O(n log n) scan however few rows
+			# it actually removes, so batching amortises that scan -- and keeping
+			# the batch proportional holds the per-insert cost flat as the cache
+			# grows, where a fixed batch degrades with size. The cache oscillates
+			# between max_size - evict_batch and max_size, so the batch is also
+			# capacity given up: 5% keeps 97.5% of what was asked for while
+			# amortising to a few microseconds per insert, which is nothing beside
+			# anything expensive enough to be worth caching.
+			# FIX: the old int(0.2 * max_size) was 0 for max_size < 5, so eviction
+			# removed nothing and the cache stayed over its limit forever.
+			self.evict_batch = evict_batch or max(1, max_size // 20)
 			# if max_size changed between runs, reduce the size now
 			# FIX: this ran before evict_cmd was assigned, so shrinking max_size
 			# between runs raised AttributeError.

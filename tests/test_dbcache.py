@@ -207,6 +207,17 @@ def test_stats_on_rowid_table_has_more_headroom(db):
 	assert s.max_local == 4061
 
 
+def test_default_evict_batch_is_five_percent(db):
+	"""Proportional keeps the amortised scan cost flat as the cache grows; 5%
+	rather than a larger share because the batch is capacity given up and the
+	scan it saves costs only microseconds."""
+	@database_cache(db, max_size=1000)
+	def f(x: int) -> int:
+		return x
+
+	assert f.evict_batch == 50
+
+
 def test_eviction_batch_is_never_zero(db):
 	"""REGRESSION: int(0.2 * max_size) is 0 for max_size < 5, so eviction
 	deleted nothing and the cache stayed permanently over its limit."""
@@ -481,8 +492,13 @@ def test_changed_return_type_reports_signature_change(db):
 	def v2(x: int) -> P:
 		return P(1, 2)
 
-	with pytest.raises(ValueError, match="signature has changed"):
+	with pytest.raises(ValueError) as exc:
 		v2(5)
+
+	# the error names both signatures
+	assert "signature has changed" in str(exc.value)
+	assert "cached: x INTEGER, return INTEGER" in str(exc.value)
+	assert "wanted: x INTEGER, return$0 INTEGER, return$1 INTEGER" in str(exc.value)
 
 
 def test_renamed_parameter_reports_signature_change(db):

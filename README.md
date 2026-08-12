@@ -32,7 +32,25 @@ def fetch(url: str) -> bytes:
 
 - `max_age` — seconds, or a `timedelta`. Entries older than this are recomputed.
 - `max_size` — maximum rows. Once exceeded, the oldest `evict_batch` entries are
-  deleted (`evict_batch` defaults to 20% of `max_size`, minimum 1).
+  deleted (`evict_batch` defaults to 5% of `max_size`, minimum 1).
+
+### Choosing `evict_batch`
+
+Eviction pays for a scan and sort of the whole table however few rows it actually
+removes, so the batch exists to amortise that scan over many inserts. Keeping it
+proportional to `max_size` is what holds the per-insert cost flat as a cache
+grows — a fixed batch gets steadily worse:
+
+    max_size            5,000    20,000    80,000
+    5% batch            5.9 µs     2.4       2.9     flat
+    fixed batch of 200  5.5 µs     9.9      45.8     degrades
+
+The batch is also capacity you give up: the cache oscillates between
+`max_size - evict_batch` and `max_size`, so a 20% batch averages 90% occupancy
+while 5% averages 97.5%. Since the amortised cost is a few microseconds either
+way — nothing beside a function expensive enough to be worth caching — the
+default favours capacity. Raise it only if profiling says eviction is actually
+costing you.
 
 ## Per-call flags
 
