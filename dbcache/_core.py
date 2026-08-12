@@ -6,7 +6,7 @@ import time
 import types
 import typing
 from abc import ABC, abstractmethod
-from dataclasses import is_dataclass, astuple, fields
+from dataclasses import dataclass, is_dataclass, astuple, fields
 from datetime import timedelta
 from types import NoneType
 
@@ -23,10 +23,10 @@ _EMPTY = inspect.Parameter.empty
 _CONTROL_KEYWORDS = frozenset({'cache', 'cache_only', 'max_age'})
 
 
-def database_cache(file, name=None, max_age=None, max_size=None, evict_batch=None):
+def database_cache(file, name=None, max_age=None, max_size=None, evict_batch=None, rowid=False):
 	if max_age is None and max_size is None:
-		return lambda func: SimpleCache(func, file, name)
-	return lambda func: TimestampCache(func, file, name, max_age, max_size, evict_batch)
+		return lambda func: SimpleCache(func, file, name, rowid=rowid)
+	return lambda func: TimestampCache(func, file, name, max_age, max_size, evict_batch, rowid=rowid)
 
 
 def quote(identifier):
@@ -42,8 +42,9 @@ def quote(identifier):
 
 class Cache(ABC):
 
-	def __init__(self, func, file, name, *, timestamp=False):
+	def __init__(self, func, file, name, *, timestamp=False, rowid=False):
 		self.func = func
+		self.rowid = rowid
 		self.conn = sqlite3.connect(file)
 		# FIX: SQLite's legacy misfeature reads a double-quoted token that matches
 		# no identifier as a string literal instead of failing. Since every
@@ -133,15 +134,33 @@ class Cache(ABC):
 				(only,) = values
 				return only_return_column.deserialize(only)
 
-		# FIX: REAL rather than INTEGER. Whole-second timestamps made every entry
-		# written in the same second compare equal, which is what let eviction's
-		# `timestamp <= cutoff` delete the entire table.
-		lookup_columns = [*output_columns, Column('timestamp', float)] if timestamp else output_columns
+		# Whole seconds. Eviction gets its exactness from LIMIT capping the row
+		# count (see evict_cmd), not from timestamps being unique, so sub-second
+		# resolution would buy nothing and cost 4 bytes a row -- REAL is always 8
+		# bytes where an int this size is 4. Truncating also errs the safe way:
+		# the stored value is never later than the real write time, so an entry
+		# expires up to a second early rather than a second late.
+		lookup_columns = [*output_columns, Column('timestamp', int)] if timestamp else output_columns
 		columns = [*input_columns, *lookup_columns]
+
+		# CREATE TABLE IF NOT EXISTS silently does nothing when the table already
+		# exists, so flipping `rowid` against an existing cache would look like it
+		# worked and change nothing. A table's rowid-ness cannot be altered, so
+		# say so rather than pretend.
+		existing = self.conn.execute(
+			"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (self.table,)).fetchone()
+		if existing is not None:
+			was_rowid = not existing[0].upper().rstrip().endswith('WITHOUT ROWID')
+			if was_rowid != rowid:
+				raise ValueError(
+					f"{self.table} already exists as a {'rowid' if was_rowid else 'WITHOUT ROWID'} table "
+					f"but rowid={rowid} was requested; a table's rowid-ness cannot be changed in place, "
+					f"so the cache must be rebuilt")
+
 		self.conn.execute(
 			f"CREATE TABLE IF NOT EXISTS {self.qtable} "
 			f"({", ".join(col.definition for col in columns)}, "
-			f"PRIMARY KEY({column_names(input_columns)})) WITHOUT ROWID")
+			f"PRIMARY KEY({column_names(input_columns)})){"" if rowid else " WITHOUT ROWID"}")
 		self.conn.commit()
 
 		self.lookup_cmd = (
@@ -202,6 +221,32 @@ class Cache(ABC):
 		# way to release it.
 		self.conn.close()
 
+	def stats(self, sample=1000):
+		"""Report how the rows are actually sitting on disk.
+
+		SQLite stores a row whole inside a page only while the record fits in
+		`maxLocal`; past that the tail spills to a chain of overflow pages, each
+		a full page however little of it is used. One byte over the limit can
+		therefore multiply the file size, and nothing in ordinary use makes that
+		visible -- the cache just quietly gets bigger. This surfaces it.
+		"""
+		page_size = self.conn.execute('PRAGMA page_size').fetchone()[0]
+		page_count = self.conn.execute('PRAGMA page_count').fetchone()[0]
+		rows = self.conn.execute(f"SELECT COUNT(*) FROM {self.qtable}").fetchone()[0]
+		sampled = self.conn.execute(
+			f"SELECT {column_names(self.columns)} FROM {self.qtable} LIMIT {int(sample)}").fetchall()
+		sizes = [record_size(row) for row in sampled] or [0]
+		return CacheStats(
+			table=self.table,
+			rowid=self.rowid,
+			rows=rows,
+			page_size=page_size,
+			file_bytes=page_size * page_count,
+			max_record=max(sizes),
+			mean_record=sum(sizes) // len(sizes),
+			max_local=max_local(page_size, self.rowid),
+			sampled=len(sampled))
+
 
 class SimpleCache(Cache):
 
@@ -228,24 +273,29 @@ class SimpleCache(Cache):
 
 class TimestampCache(Cache):
 
-	def __init__(self, func, file, name, max_age=None, max_size=None, evict_batch=None):
-		super().__init__(func, file, name, timestamp=True)
+	def __init__(self, func, file, name, max_age=None, max_size=None, evict_batch=None, *, rowid=False):
+		super().__init__(func, file, name, timestamp=True, rowid=rowid)
 		self.max_age = get_age(max_age)
 		if self.max_age < 1:
 			raise ValueError(f"{max_age=}")
 
-		# FIX: this is the original single range-delete, with two corrections.
-		# (1) OFFSET count landed on the count+1'th oldest row, which `<=` then
-		# included -- one row too many; binding count-1 makes it exact.
-		# (2) The cache-wiping bug came from whole-second timestamps: every entry
-		# written in the same second tied, and `<=` swept up all of them. The
-		# timestamp column is REAL now (see __call__), so a tie needs two writes
-		# inside the clock's granularity *and* the tie must straddle the cutoff.
-		# Measured overshoot is 0 even writing as fast as the loop allows.
+		# FIX: eviction was `DELETE ... WHERE timestamp <= (nth oldest timestamp)`.
+		# With whole-second timestamps every entry written in the same second tied,
+		# and `<=` matched all of them -- a single eviction emptied the table.
+		# (It was also off by one even with distinct timestamps: OFFSET n lands on
+		# the n+1'th row and `<=` includes it.)
+		#
+		# Delete by key instead: the subquery names exactly the `count` oldest rows
+		# and LIMIT caps it, so ties cannot widen the delete no matter how many
+		# entries share a timestamp. Exactness comes from the query rather than
+		# from timestamp resolution, which is what lets the column stay a 4-byte
+		# int. The key is the ORDER BY tiebreak so the choice among equal
+		# timestamps is at least deterministic.
+		pk = column_names(self.input_columns)
 		self.evict_cmd = (
-			f"DELETE FROM {self.qtable} "
-			f"WHERE timestamp <= (SELECT timestamp FROM {self.qtable} "
-			"ORDER BY timestamp ASC LIMIT 1 OFFSET ?)")
+			f"DELETE FROM {self.qtable} WHERE ({pk}) IN ("
+			f"SELECT {pk} FROM {self.qtable} "
+			f"ORDER BY timestamp ASC, {pk} LIMIT ?)")
 
 		self.size = self.conn.execute(f"SELECT COUNT(*) FROM {self.qtable}").fetchone()[0]
 		if not max_size:
@@ -278,7 +328,7 @@ class TimestampCache(Cache):
 
 		result = self.func(*args, **kwargs)
 		self.concat(values, result)
-		values.append(time.time())
+		values.append(int(time.time()))
 		self.conn.execute(self.insert_cmd, values)
 		if cached_output is None:
 			self.size += 1
@@ -289,12 +339,11 @@ class TimestampCache(Cache):
 		return result
 
 	def evict(self, count):
-		# A count past the end makes the subquery return NULL, and `<= NULL` is
-		# NULL, so the delete would silently remove nothing. Clamp instead.
-		count = min(count, self.size)
+		# LIMIT handles a count past the end on its own -- the subquery just
+		# returns every row -- so only the degenerate case needs guarding.
 		if count < 1:
 			return
-		cur = self.conn.execute(self.evict_cmd, (count - 1,))
+		cur = self.conn.execute(self.evict_cmd, (count,))
 		self.size -= cur.rowcount
 
 	def clear(self):
@@ -319,6 +368,110 @@ class CacheMiss(Exception):
 
 def column_names(columns):
 	return ', '.join(col.quoted for col in columns)
+
+
+def max_local(page_size, rowid):
+	"""Largest record that still fits inside a page, past which rows overflow.
+
+	A rowid table keeps rows in a table b-tree and gets nearly the whole page.
+	A WITHOUT ROWID table keeps them in an *index* b-tree, which reserves far
+	more room for tree structure -- roughly a quarter as much usable space.
+	Assumes no reserved bytes per page, which is the default.
+	"""
+	return (page_size - 35) if rowid else ((page_size - 12) * 64 // 255) - 23
+
+
+def varint_len(n):
+	length = 1
+	while n >= 128:
+		n >>= 7
+		length += 1
+	return length
+
+
+def serial_type(value):
+	"""(serial type, bytes in the record body) for one stored value."""
+	if value is None:
+		return 0, 0
+	if isinstance(value, int):
+		# 0 and 1 have dedicated serial types and occupy no body bytes at all
+		if value == 0:
+			return 8, 0
+		if value == 1:
+			return 9, 0
+		for bits, tp, width in ((8, 1, 1), (16, 2, 2), (24, 3, 3), (32, 4, 4), (48, 5, 6)):
+			if -(1 << (bits - 1)) <= value < (1 << (bits - 1)):
+				return tp, width
+		return 6, 8
+	if isinstance(value, float):
+		return 7, 8
+	if isinstance(value, (bytes, bytearray)):
+		return 12 + 2 * len(value), len(value)
+	if isinstance(value, str):
+		width = len(value.encode())
+		return 13 + 2 * width, width
+	raise TypeError(f"not an SQLite storage class: {value!r}")
+
+
+def record_size(values):
+	"""Bytes SQLite uses for one record: header varints plus the body."""
+	parts = [serial_type(v) for v in values]
+	body = sum(width for _, width in parts)
+	header = sum(varint_len(tp) for tp, _ in parts)
+	# the header's own length varint counts toward the header, so settle it
+	for extra in (1, 2, 3, 4):
+		if varint_len(header + extra) == extra:
+			header += extra
+			break
+	return header + body
+
+
+@dataclass(frozen=True, slots=True)
+class CacheStats:
+	"""A snapshot of how one cache's rows are sitting on disk."""
+
+	table: str
+	rowid: bool
+	rows: int
+	page_size: int
+	file_bytes: int
+	max_record: int
+	mean_record: int
+	max_local: int
+	sampled: int
+
+	@property
+	def overflowing(self) -> bool:
+		return self.max_record > self.max_local
+
+	@property
+	def headroom(self) -> int:
+		"""Bytes a record may still grow before it starts spilling."""
+		return self.max_local - self.max_record
+
+	def __str__(self):
+		layout = 'rowid' if self.rowid else 'WITHOUT ROWID'
+		note = f" (sampled {self.sampled})" if self.sampled < self.rows else ""
+		lines = [
+			f"{self.table}: {self.rows} rows, {layout}, page_size={self.page_size}",
+			f"  file        {self.file_bytes:,} bytes"
+			f"{f' ({self.file_bytes // self.rows:,}/row)' if self.rows else ''}",
+			f"  record      max {self.max_record}, mean {self.mean_record}{note}",
+			f"  maxLocal    {self.max_local}",
+		]
+		if self.overflowing:
+			spill = self.max_record - self.max_local
+			lines.append(f"  OVERFLOWING -- {spill} bytes spill to an overflow page per row")
+			bigger = next((p for p in (8192, 16384, 32768, 65536)
+			               if max_local(p, self.rowid) >= self.max_record), None)
+			fix = ["rowid=True"] if not self.rowid and max_local(self.page_size, True) >= self.max_record else []
+			if bigger:
+				fix.append(f"page_size={bigger}")
+			if fix:
+				lines.append(f"  try         {' or '.join(fix)}")
+		else:
+			lines.append(f"  headroom    {self.headroom} bytes before rows start overflowing")
+		return "\n".join(lines)
 
 
 def identity(x):

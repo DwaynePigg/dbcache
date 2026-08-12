@@ -69,10 +69,52 @@ def config(env: str) -> Annotated[dict, (dump, load)]:
 With a lone serializer, reads return the *stored* representation rather than the
 original value.
 
+## Storage layout
+
+Tables are `WITHOUT ROWID` by default, which is the right choice for the small
+records a cache usually holds — the row lives directly in the primary-key B-tree,
+with no rowid and no separate index.
+
+It stops being the right choice for large values. A `WITHOUT ROWID` row is stored
+in an *index* B-tree, which reserves far more of each page for tree structure, so
+the largest record that still fits inside a page is only
+
+    ((page_size - 12) * 64 / 255) - 23      # 1002 bytes at the default 4096
+
+against `page_size - 35` (4061) for an ordinary rowid table. Exceed it and every
+row spills onto overflow pages, each a whole page however little of it is used —
+which can more than double the file. Pass `rowid=True` for those caches:
+
+```python
+@database_cache('cache.sqlite', rowid=True)
+def fetch(url: str) -> bytes:
+    ...
+```
+
+A table's rowid-ness cannot be changed in place, so switching the flag on an
+existing cache raises rather than silently keeping the old layout. Delete the
+file to rebuild.
+
 ## Cache objects
 
 The decorated function is a `Cache`, with `.clear()`, `.vacuum()`, `.contents()`
 and `.close()`.
+
+`.stats()` reports how rows are actually sitting on disk, which is otherwise
+invisible — a cache that has fallen off the overflow cliff looks completely
+normal from the outside:
+
+```
+>>> get_products.stats()
+cache: 4096 rows, WITHOUT ROWID, page_size=4096
+  file        19,177,472 bytes (4,682/row)
+  record      max 1919, mean 1918
+  maxLocal    1002
+  OVERFLOWING -- 917 bytes spill to an overflow page per row
+  try         rowid=True or page_size=8192
+```
+
+It exposes `.overflowing` and `.headroom` alongside the raw numbers.
 
 ## Caveats
 

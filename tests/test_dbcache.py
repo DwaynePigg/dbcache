@@ -4,6 +4,7 @@ Every test marked REGRESSION pins a bug that was present before the src-layout
 rewrite; each one failed against the original dbcache.py.
 """
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Annotated
@@ -11,7 +12,7 @@ from typing import Annotated
 import pytest
 
 from dbcache import CacheMiss, database_cache
-from dbcache._core import Cache
+from dbcache._core import Cache, max_local, record_size, serial_type
 
 
 @pytest.fixture
@@ -35,32 +36,44 @@ def test_eviction_removes_exactly_the_batch(db):
 	f.conn.commit()
 	assert len(f.contents()) == 10
 
-	f(100)  # the 11th entry trips eviction; its timestamp is time.time(), newest
+	f(100)  # the 11th entry trips eviction; its timestamp is now(), so newest
 	assert len(f.contents()) == 8
 	assert f.size == 8
 	assert {row[0] for row in f.contents()} == {3, 4, 5, 6, 7, 8, 9, 100}
 
 
-def test_eviction_survives_a_burst_of_writes(db):
-	"""REGRESSION: timestamps were whole seconds, so a burst of entries written
-	inside one second all tied and `timestamp <= cutoff` emptied the table.
-	Sub-second timestamps keep the cutoff discriminating."""
+def test_eviction_is_exact_when_every_timestamp_ties(db):
+	"""REGRESSION: timestamps are whole seconds, so a burst written inside one
+	second all tied and `timestamp <= cutoff` emptied the entire table. Deleting
+	by key caps the count at LIMIT, so ties cannot widen the delete."""
 	@database_cache(db, max_size=10, evict_batch=3)
 	def f(x: int) -> int:
 		return x * 2
 
-	for i in range(11):  # written as fast as the loop allows
+	for i in range(10):
 		f(i)
+	f.conn.execute('UPDATE "f" SET timestamp = 1700000000')  # force a total tie
+	f.conn.commit()
 
-	# the scenario actually under test: these all land in the same wall second
-	assert len({int(row[-1]) for row in f.contents()}) <= 2
+	f(100)
 	assert len(f.contents()) == 8
 	assert f.size == 8
 
 
-def test_evict_beyond_table_size_is_clamped(db):
-	"""A count past the end made the subquery NULL, and `<= NULL` deleted
-	nothing at all rather than everything."""
+def test_eviction_survives_a_real_burst(db):
+	"""The same scenario without forcing it: entries written as fast as the loop
+	allows share a wall-clock second."""
+	@database_cache(db, max_size=10, evict_batch=3)
+	def f(x: int) -> int:
+		return x * 2
+
+	for i in range(11):
+		f(i)
+	assert len({row[-1] for row in f.contents()}) <= 2  # they really did tie
+	assert len(f.contents()) == 8
+
+
+def test_evict_beyond_table_size_empties_it(db):
 	@database_cache(db, max_size=10)
 	def f(x: int) -> int:
 		return x
@@ -70,6 +83,128 @@ def test_evict_beyond_table_size_is_clamped(db):
 	f.evict(500)
 	assert f.contents() == []
 	assert f.size == 0
+
+
+def test_timestamp_is_a_whole_second(db):
+	"""The column is a 4-byte int, not an 8-byte REAL."""
+	@database_cache(db, max_age=60)
+	def f(x: int) -> int:
+		return x
+
+	f(1)
+	(stored,) = f.conn.execute('SELECT timestamp FROM "f"').fetchone()
+	assert isinstance(stored, int)
+	# truncation errs early, never late: stored is never after the real write
+	assert stored <= time.time()
+
+
+# --- table layout --------------------------------------------------------------
+
+def test_rowid_flag_changes_the_layout(db):
+	@database_cache(db, name="wor")
+	def a(x: int) -> int:
+		return x
+
+	@database_cache(db, name="rid", rowid=True)
+	def b(x: int) -> int:
+		return x
+
+	def sql(name):
+		return a.conn.execute(
+			"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()[0]
+
+	assert sql("wor").rstrip().endswith("WITHOUT ROWID")
+	assert not sql("rid").rstrip().endswith("WITHOUT ROWID")
+	assert b(3) == 3 and b(3) == 3  # and it still works
+
+
+def test_rowid_mismatch_is_rejected(db):
+	"""CREATE TABLE IF NOT EXISTS silently no-ops on an existing table, so
+	flipping the flag would otherwise look like it worked and change nothing."""
+	@database_cache(db, name="t")
+	def a(x: int) -> int:
+		return x
+
+	a(1)
+	a.close()
+
+	with pytest.raises(ValueError, match="rowid-ness cannot be changed"):
+		@database_cache(db, name="t", rowid=True)
+		def b(x: int) -> int:
+			return x
+
+
+def test_eviction_works_on_a_rowid_table(db):
+	@database_cache(db, max_size=10, evict_batch=3, rowid=True)
+	def f(x: int) -> int:
+		return x * 2
+
+	for i in range(10):
+		f(i)
+	f.conn.execute('UPDATE "f" SET timestamp = 1700000000')
+	f.conn.commit()
+	f(100)
+	assert len(f.contents()) == 8
+
+
+# --- stats ---------------------------------------------------------------------
+
+def test_record_size_matches_sqlite_serial_types():
+	assert serial_type(None) == (0, 0)
+	assert serial_type(0) == (8, 0)      # constants cost no body bytes
+	assert serial_type(1) == (9, 0)
+	assert serial_type(200) == (2, 2)
+	assert serial_type(1786560274) == (4, 4)     # int timestamp
+	assert serial_type(1786560274.5) == (7, 8)   # REAL is always 8
+	assert serial_type(b'abc') == (18, 3)
+	assert serial_type('abc') == (19, 3)
+	# 2 one-byte columns + 1 header-length byte
+	assert record_size([200, 200]) == 3 + 4
+
+
+def test_max_local_formulas():
+	assert max_local(4096, rowid=True) == 4061
+	assert max_local(4096, rowid=False) == 1002
+	assert max_local(8192, rowid=False) == 2030
+
+
+def test_stats_reports_headroom(db):
+	@database_cache(db, max_age=60)
+	def small(x: int) -> int:
+		return x * 2
+
+	for i in range(5):
+		small(i)
+	s = small.stats()
+	assert s.rows == 5
+	assert not s.overflowing
+	assert s.max_local == 1002
+	assert s.headroom > 900
+	assert "headroom" in str(s)
+
+
+def test_stats_detects_overflow(db):
+	@database_cache(db)
+	def big(x: int) -> bytes:
+		return bytes(3000)  # far past maxLocal for a WITHOUT ROWID table
+
+	big(1)
+	s = big.stats()
+	assert s.overflowing
+	assert s.max_record > s.max_local
+	assert "OVERFLOWING" in str(s)
+	assert "rowid=True" in str(s)  # and it suggests the fix
+
+
+def test_stats_on_rowid_table_has_more_headroom(db):
+	@database_cache(db, name="t", rowid=True)
+	def big(x: int) -> bytes:
+		return bytes(3000)
+
+	big(1)
+	s = big.stats()
+	assert not s.overflowing  # 3000 < 4061
+	assert s.max_local == 4061
 
 
 def test_eviction_batch_is_never_zero(db):
