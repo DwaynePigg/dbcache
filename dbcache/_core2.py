@@ -26,9 +26,12 @@ _EMPTY = inspect.Parameter.empty
 
 # __call__ forwards **kwargs to the wrapped function, so a parameter sharing a
 # name with one of the cache's own keyword arguments would be swallowed as one
-# and silently corrupt the cache key; a parameter named `timestamp` would
-# collide with the cache's own column. Reject both at decoration time.
-_RESERVED = frozenset({'refresh', 'cache_only', 'max_age', 'timestamp'})
+# and silently corrupt the cache key. `timestamp` would collide with the
+# cache's own column, and a column named `rowid` (or either of its aliases)
+# shadows the implicit one that eviction deletes by. Reject all of them at
+# decoration time, where the message can say so.
+_RESERVED = frozenset({
+	'refresh', 'cache_only', 'max_age', 'timestamp', 'rowid', 'oid', '_rowid_'})
 
 
 def database_cache(file, name=None, max_age=None, max_size=None):
@@ -137,11 +140,15 @@ class DatabaseCache:
 		self.store_cmd = (
 			f"INSERT OR REPLACE INTO {self.qtable} ({column_names(self.columns)}) "
 			f"VALUES ({', '.join('?' for _ in self.columns)})")
-		# LIMIT keeps the delete exact however many timestamps tie; the key in
-		# the ORDER BY makes the choice among ties deterministic
+		# Deleting by rowid is what lets the index above do its job. Naming the
+		# key columns in the ORDER BY instead defeats it -- they are not in the
+		# index, so SQLite gives up and sorts the whole table on every single
+		# eviction. LIMIT keeps the delete exact however many timestamps tie,
+		# and the index's own (timestamp, rowid) order breaks those ties by
+		# insertion order, so the oldest entry really does go first.
 		self.evict_cmd = (
-			f"DELETE FROM {self.qtable} WHERE ({key}) IN "
-			f"(SELECT {key} FROM {self.qtable} ORDER BY timestamp, {key} LIMIT ?)")
+			f"DELETE FROM {self.qtable} WHERE rowid IN "
+			f"(SELECT rowid FROM {self.qtable} ORDER BY timestamp LIMIT ?)")
 
 		self.size = self.conn.execute(f"SELECT COUNT(*) FROM {self.qtable}").fetchone()[0]
 		if self.size > self.max_size:  # max_size shrank since the last run
