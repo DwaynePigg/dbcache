@@ -18,7 +18,7 @@ import math
 import sqlite3
 import time
 import typing
-from dataclasses import astuple, fields, is_dataclass
+from dataclasses import astuple, dataclass, fields, is_dataclass
 from datetime import timedelta
 from types import NoneType, UnionType
 
@@ -112,6 +112,13 @@ class DatabaseCache:
 		# raised in fetch().
 		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
 		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+		# Every call commits, and under the stock settings that commit is by far
+		# the most expensive thing a cached call does -- around 150x the cost of
+		# the lookup and the write together. These two pragmas trade durability
+		# for that: a power failure can cost the last few entries written. For a
+		# cache that is the right trade, since a lost entry is only recomputed.
+		self.conn.execute('PRAGMA journal_mode = WAL')
+		self.conn.execute('PRAGMA synchronous = NORMAL')
 
 		key = column_names(self.input_columns)
 		self.conn.execute(
@@ -205,6 +212,36 @@ class DatabaseCache:
 		return self.conn.execute(
 			f"SELECT {column_names(self.columns)} FROM {self.qtable} ORDER BY timestamp").fetchall()
 
+	def stats(self):
+		"""How many bytes each column takes up, and how near a row is to spilling.
+
+		SQLite keeps a row inside its page only while the record fits in the
+		limit below; past that the tail spills to a chain of overflow pages,
+		each a whole page however little of it is used. Crossing the limit by
+		one byte can therefore multiply the file size, and shaving a column to
+		get back under it can halve the file again -- but nothing in ordinary
+		use makes any of that visible. Print this to see it.
+		"""
+		page_size = self.conn.execute('PRAGMA page_size').fetchone()[0]
+		page_count = self.conn.execute('PRAGMA page_count').fetchone()[0]
+		# octet_length is exact for text and blobs, which are the columns that
+		# vary; a number occupies at most 8 bytes however many digits it prints
+		sizes = ', '.join(
+			f"avg({e}), max({e})" for e in (size_expr(col) for col in self.columns))
+		rows, *measured = self.conn.execute(
+			f"SELECT count(*), {sizes} FROM {self.qtable}").fetchone()
+		columns = [
+			(col.name, mean or 0, largest or 0)
+			for col, mean, largest in zip(self.columns, measured[::2], measured[1::2])]
+		return CacheStats(
+			table=self.table,
+			rows=rows,
+			file_bytes=page_size * page_count,
+			columns=columns,
+			max_record=record_bytes(self.columns, [largest for _, _, largest in columns]),
+			# a row lives in the table b-tree, which gets all of the page but its header
+			page_limit=page_size - 35)
+
 	def vacuum(self):
 		"""Give the space freed by deleted entries back to the filesystem."""
 		self.conn.commit()  # VACUUM cannot run inside a transaction
@@ -257,6 +294,56 @@ def make_codec(return_type):
 	return Codec(
 		[Column('return', return_type)],
 		split=lambda value: (value,), join=lambda elements: elements[0])
+
+
+@dataclass(frozen=True)
+class CacheStats:
+	"""What stats() reports; print it."""
+
+	table: str
+	rows: int
+	file_bytes: int
+	columns: list  # (name, mean bytes, largest bytes)
+	max_record: int
+	page_limit: int
+
+	@property
+	def overflowing(self):
+		return self.max_record > self.page_limit
+
+	def __str__(self):
+		per_row = f" ({self.file_bytes // self.rows}/row)" if self.rows else ""
+		lines = [f"{self.table}: {self.rows:,} rows, {self.file_bytes:,} bytes on disk{per_row}"]
+		lines += [f"  {name:<14} mean {mean:>8,.1f}b  max {largest:>7,}b"
+		          for name, mean, largest in self.columns]
+		if self.overflowing:
+			lines.append(
+				f"  {'OVERFLOWING':<14} the widest record is {self.max_record:,}b against a "
+				f"{self.page_limit:,}b limit, so {self.max_record - self.page_limit:,}b spill "
+				f"to an overflow page")
+		else:
+			lines.append(
+				f"  {'headroom':<14} {self.page_limit - self.max_record:,}b, on a widest record "
+				f"of {self.max_record:,}b, before rows start spilling to overflow pages")
+		return "\n".join(lines)
+
+
+def size_expr(column):
+	"""SQL for the bytes one value of a column occupies. NULL occupies none."""
+	if column.sql_type in ('TEXT', 'BLOB'):
+		return f"coalesce(octet_length({column.quoted}), 0)"
+	return f"min(8, coalesce(octet_length({column.quoted}), 0))"
+
+
+def record_bytes(columns, sizes):
+	"""Roughly the bytes one record occupies, its type header included."""
+	total = 1  # the header's own length, as a varint
+	for column, size in zip(columns, sizes):
+		# a text or blob serial type encodes the length, so it grows with it;
+		# every number fits in a one-byte serial type
+		serial = 13 + 2 * size if column.sql_type in ('TEXT', 'BLOB') else 8
+		total += (1 if serial < 128 else 2 if serial < 16384 else 3) + size
+	return total
 
 
 SQL_TYPES = {
