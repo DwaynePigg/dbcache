@@ -5,13 +5,13 @@ name = "dbcache"
 version = "0.1.0"
 description = "SQLite-backed function cache decorator"
 readme = "README.md"
-# Was ">=3.10", but the module used PEP 701 f-string nesting and would not parse
-# before 3.12. The syntax is fixed, so 3.10 is now genuine -- and tested.
-requires-python = ">=3.10"
+# 3.12 is a hard floor, not a preference: the SQL builders use PEP 701 f-strings
+# (same quote character nested inside an interpolation), which earlier versions
+# cannot parse at all.
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Database",
-    "Typing :: Typed",
 ]
 
 # TODO: add authors, license and [project.urls] before publishing -- left out

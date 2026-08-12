@@ -45,6 +45,14 @@ class Cache(ABC):
 	def __init__(self, func, file, name, *, timestamp=False):
 		self.func = func
 		self.conn = sqlite3.connect(file)
+		# FIX: SQLite's legacy misfeature reads a double-quoted token that matches
+		# no identifier as a string literal instead of failing. Since every
+		# identifier here is quoted, that turned "no such column" into silently
+		# returning the column *name* as data -- a changed return type would
+		# deserialize 'return$0' as a cached value rather than raising. Turning
+		# DQS off makes quoted tokens strictly identifiers. (Python 3.12+.)
+		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
 		self.table = name or func.__name__
 		self.qtable = quote(self.table)
 		functools.update_wrapper(self, func)
@@ -125,26 +133,26 @@ class Cache(ABC):
 				(only,) = values
 				return only_return_column.deserialize(only)
 
-		lookup_columns = [*output_columns, Column('timestamp', int)] if timestamp else output_columns
+		# FIX: REAL rather than INTEGER. Whole-second timestamps made every entry
+		# written in the same second compare equal, which is what let eviction's
+		# `timestamp <= cutoff` delete the entire table.
+		lookup_columns = [*output_columns, Column('timestamp', float)] if timestamp else output_columns
 		columns = [*input_columns, *lookup_columns]
 		self.conn.execute(
 			f"CREATE TABLE IF NOT EXISTS {self.qtable} "
-			f"({', '.join(col.definition for col in columns)}, "
+			f"({", ".join(col.definition for col in columns)}, "
 			f"PRIMARY KEY({column_names(input_columns)})) WITHOUT ROWID")
 		self.conn.commit()
 
 		self.lookup_cmd = (
 			f"SELECT {column_names(lookup_columns)} "
 			f"FROM {self.qtable} "
-			f"WHERE {' AND '.join(f'{col.quoted}=?' for col in input_columns)}")
-		# FIX: the inner f-string used double quotes inside a double-quoted
-		# f-string, which is PEP 701 syntax -- the module would not even parse on
-		# the Python 3.10/3.11 that pyproject.toml claimed to support.
+			f"WHERE {" AND ".join(f"{col.quoted}=?" for col in input_columns)}")
 		self.insert_cmd = (
 			f"INSERT INTO {self.qtable} ({column_names(columns)}) "
-			f"VALUES ({', '.join('?' for _ in columns)}) "
+			f"VALUES ({", ".join("?" for _ in columns)}) "
 			f"ON CONFLICT({column_names(input_columns)}) "
-			f"DO UPDATE SET {', '.join(f'{col.quoted}=excluded.{col.quoted}' for col in lookup_columns)}")
+			f"DO UPDATE SET {", ".join(f"{col.quoted}=excluded.{col.quoted}" for col in lookup_columns)}")
 		self.signature = sig
 		self.input_columns = input_columns
 		self.columns = columns
@@ -226,24 +234,18 @@ class TimestampCache(Cache):
 		if self.max_age < 1:
 			raise ValueError(f"{max_age=}")
 
-		pk = column_names(self.input_columns)
-		# FIX: eviction was `DELETE ... WHERE timestamp <= (nth oldest timestamp)`.
-		# Timestamps are whole seconds, so entries written in the same second tie
-		# and `<=` swept up every one of them -- a single eviction emptied the
-		# whole table. (It was also off by one even with distinct timestamps,
-		# since OFFSET n lands on the n+1'th row and `<=` includes it.) Delete
-		# exactly `count` rows addressed by primary key, ordering by the key as a
-		# tiebreak so the choice is deterministic when timestamps are equal.
+		# FIX: this is the original single range-delete, with two corrections.
+		# (1) OFFSET count landed on the count+1'th oldest row, which `<=` then
+		# included -- one row too many; binding count-1 makes it exact.
+		# (2) The cache-wiping bug came from whole-second timestamps: every entry
+		# written in the same second tied, and `<=` swept up all of them. The
+		# timestamp column is REAL now (see __call__), so a tie needs two writes
+		# inside the clock's granularity *and* the tie must straddle the cutoff.
+		# Measured overshoot is 0 even writing as fast as the loop allows.
 		self.evict_cmd = (
-			f"DELETE FROM {self.qtable} WHERE ({pk}) IN ("
-			f"SELECT {pk} FROM {self.qtable} "
-			f"ORDER BY timestamp ASC, {pk} LIMIT ?)")
-
-		# FIX: the table is WITHOUT ROWID keyed on the inputs, so the eviction
-		# subquery's ORDER BY timestamp meant a full scan and sort every time.
-		self.conn.execute(
-			f"CREATE INDEX IF NOT EXISTS {quote(f'{self.table}$timestamp')} ON {self.qtable}(timestamp)")
-		self.conn.commit()
+			f"DELETE FROM {self.qtable} "
+			f"WHERE timestamp <= (SELECT timestamp FROM {self.qtable} "
+			"ORDER BY timestamp ASC LIMIT 1 OFFSET ?)")
 
 		self.size = self.conn.execute(f"SELECT COUNT(*) FROM {self.qtable}").fetchone()[0]
 		if not max_size:
@@ -276,7 +278,7 @@ class TimestampCache(Cache):
 
 		result = self.func(*args, **kwargs)
 		self.concat(values, result)
-		values.append(int(time.time()))
+		values.append(time.time())
 		self.conn.execute(self.insert_cmd, values)
 		if cached_output is None:
 			self.size += 1
@@ -287,7 +289,12 @@ class TimestampCache(Cache):
 		return result
 
 	def evict(self, count):
-		cur = self.conn.execute(self.evict_cmd, (count,))
+		# A count past the end makes the subquery return NULL, and `<= NULL` is
+		# NULL, so the delete would silently remove nothing. Clamp instead.
+		count = min(count, self.size)
+		if count < 1:
+			return
+		cur = self.conn.execute(self.evict_cmd, (count - 1,))
 		self.size -= cur.rowcount
 
 	def clear(self):
@@ -389,7 +396,7 @@ class Column:
 
 	@property
 	def definition(self):
-		return f"{self.quoted} {self.sql_type}{'' if self.nullable else ' NOT NULL'}"
+		return f"{self.quoted} {self.sql_type}{"" if self.nullable else " NOT NULL"}"
 
 	def __repr__(self):
 		# FIX: __name__ is missing on partials and callable objects.

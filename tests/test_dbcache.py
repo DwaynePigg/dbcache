@@ -22,21 +22,54 @@ def db(tmp_path):
 # --- eviction -----------------------------------------------------------------
 
 def test_eviction_removes_exactly_the_batch(db):
-	"""REGRESSION: timestamps are whole seconds, so every entry written in the
-	same second tied and `timestamp <= cutoff` deleted the entire table."""
+	"""REGRESSION: OFFSET n landed on the n+1'th oldest row and `<=` included
+	it, so eviction always removed one row too many."""
 	@database_cache(db, max_size=10, evict_batch=3)
 	def f(x: int) -> int:
 		return x * 2
 
 	for i in range(10):
 		f(i)
+	# pin the timestamps so this asserts eviction arithmetic, not clock behaviour
+	f.conn.execute('UPDATE "f" SET timestamp = "x"')
+	f.conn.commit()
 	assert len(f.contents()) == 10
 
-	f(100)  # the 11th entry trips eviction
+	f(100)  # the 11th entry trips eviction; its timestamp is time.time(), newest
 	assert len(f.contents()) == 8
 	assert f.size == 8
-	# the three oldest by (timestamp, key) go; ties break on the key
 	assert {row[0] for row in f.contents()} == {3, 4, 5, 6, 7, 8, 9, 100}
+
+
+def test_eviction_survives_a_burst_of_writes(db):
+	"""REGRESSION: timestamps were whole seconds, so a burst of entries written
+	inside one second all tied and `timestamp <= cutoff` emptied the table.
+	Sub-second timestamps keep the cutoff discriminating."""
+	@database_cache(db, max_size=10, evict_batch=3)
+	def f(x: int) -> int:
+		return x * 2
+
+	for i in range(11):  # written as fast as the loop allows
+		f(i)
+
+	# the scenario actually under test: these all land in the same wall second
+	assert len({int(row[-1]) for row in f.contents()}) <= 2
+	assert len(f.contents()) == 8
+	assert f.size == 8
+
+
+def test_evict_beyond_table_size_is_clamped(db):
+	"""A count past the end made the subquery NULL, and `<= NULL` deleted
+	nothing at all rather than everything."""
+	@database_cache(db, max_size=10)
+	def f(x: int) -> int:
+		return x
+
+	for i in range(5):
+		f(i)
+	f.evict(500)
+	assert f.contents() == []
+	assert f.size == 0
 
 
 def test_eviction_batch_is_never_zero(db):
@@ -291,6 +324,48 @@ def test_missing_table_reports_signature_change(db):
 	h.conn.execute('ALTER TABLE "h" RENAME TO "h_old"')
 	with pytest.raises(ValueError, match="signature has changed"):
 		h(2)
+
+
+def test_changed_return_type_reports_signature_change(db):
+	"""REGRESSION: quoting every identifier exposed SQLite's double-quoted
+	string-literal misfeature. The missing columns were read as literals, so this
+	returned P(a='return$0', b='return$1') without ever calling the function."""
+	@database_cache(db, name="f")
+	def v1(x: int) -> int:
+		return x * 100
+
+	v1(5)
+	v1.close()
+
+	@dataclass
+	class P:
+		a: int
+		b: int
+
+	@database_cache(db, name="f")
+	def v2(x: int) -> P:
+		return P(1, 2)
+
+	with pytest.raises(ValueError, match="signature has changed"):
+		v2(5)
+
+
+def test_renamed_parameter_reports_signature_change(db):
+	"""REGRESSION: as above, but the missing column sat in the WHERE clause,
+	where it silently compared a string literal and reported a cache miss."""
+	@database_cache(db, name="f")
+	def v1(x: int) -> int:
+		return x
+
+	v1(5)
+	v1.close()
+
+	@database_cache(db, name="f")
+	def v2(y: int) -> int:
+		return y
+
+	with pytest.raises(ValueError, match="signature has changed"):
+		v2(5)
 
 
 def test_other_operational_errors_are_not_disguised(db):

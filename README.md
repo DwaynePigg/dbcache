@@ -92,7 +92,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-Tested on CPython 3.10, 3.11 and 3.13.
+Requires CPython 3.12 or newer; tested on 3.12 and 3.13.
 
 The package directory sits at the repo root, so `import dbcache` from here resolves
 to the working tree and shadows whatever is installed. That is convenient day to
