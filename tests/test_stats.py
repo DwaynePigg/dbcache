@@ -71,8 +71,88 @@ def test_stats_shows_a_record_total_line(db):
 	assert s.max_record - body < 16
 	rendered = str(s)
 	assert 'record' in rendered
-	assert f'of {s.page_limit:,}b a page holds' in rendered
+	assert 'per page' in rendered
 	assert s.headroom == s.page_limit - s.max_record
+
+
+def test_rows_per_page_drops_exactly_where_predicted(tmp_path):
+	"""room_before_fewer_per_page says how much the record may grow before one
+	fewer row shares a page. Grow it by exactly that and the count must hold;
+	grow it by one more and the count must drop -- and the file must roughly
+	double, since each row now owns a page it only half fills."""
+	def build(name, payload):
+		@database_cache(tmp_path / f'{name}.db', name='t')
+		def f(a: int) -> bytes:
+			return bytes(payload)
+
+		for i in range(400):
+			f(i)
+		measured = stats(f)
+		f.close()
+		return measured, (tmp_path / f'{name}.db').stat().st_size
+
+	before, small_file = build('before', 1900)
+	assert before.rows_per_page == 2
+	room = before.room_before_fewer_per_page
+	assert room > 0
+
+	at_limit, _ = build('at', 1900 + room)
+	assert at_limit.rows_per_page == 2, 'the last byte that still fits dropped a row early'
+
+	over, big_file = build('over', 1900 + room + 1)
+	assert over.rows_per_page == 1, 'one byte past the limit did not drop a row'
+	assert not over.overflowing, 'this is the packing cliff, not the overflow cliff'
+	# the file grows sharply but not by a clean 2x: page splits leave some pages
+	# partly filled, so this is a sanity check, not the measurement
+	assert big_file > small_file * 1.5
+
+
+def test_the_packing_cliff_is_nearer_than_the_overflow_cliff(db):
+	"""For a querycache-shaped row the binding limit is rows-per-page, which is
+	an order of magnitude closer than the overflow limit headroom reports."""
+	@database_cache(db)
+	def f(card: int, finish: int, offset: int) -> bytes:
+		return bytes(1900)
+
+	f(250000, 1, 0)
+	s = stats(f)
+	assert s.rows_per_page == 2
+	assert not s.overflowing
+	assert s.room_before_fewer_per_page < s.headroom / 10
+	assert '2 row(s)' in str(s)
+
+
+def test_rows_per_page_is_one_when_a_record_overflows(db):
+	@database_cache(db)
+	def f(x: int) -> bytes:
+		return bytes(5000)
+
+	f(1)
+	s = stats(f)
+	assert s.overflowing
+	assert s.rows_per_page == 1
+	assert s.room_before_fewer_per_page is None  # the next threshold is overflow
+
+
+def test_stats_reads_a_non_default_page_size(tmp_path):
+	"""page_size is not always 4096, and every threshold scales with it."""
+	import sqlite3
+
+	path = tmp_path / 'big_pages.db'
+	pre = sqlite3.connect(path)  # must be set before any table exists
+	pre.execute('PRAGMA page_size = 8192')
+	pre.execute('VACUUM')
+	pre.close()
+
+	@database_cache(path, name='t')
+	def f(x: int) -> bytes:
+		return bytes(1900)
+
+	f(1)
+	s = stats(f)
+	assert s.page_size == 8192
+	assert s.page_limit == 8192 - 35
+	assert s.rows_per_page == 4  # twice what the same row gets in a 4096 page
 
 
 def test_stats_detects_overflow(db):
@@ -116,6 +196,27 @@ def test_stats_estimate_is_close_to_the_real_record(db):
 	# x(1) + return(900) + timestamp(4) plus headers: ~910, and certainly not
 	# off by enough to move the overflow verdict
 	assert 900 < s.max_record < 930
+
+
+def test_a_single_int_key_costs_no_record_bytes(db):
+	"""SQLite makes a lone INTEGER primary key an alias for the rowid, so it is
+	stored in the cell's rowid varint and occupies nothing inside the record.
+	Counting it as a stored value overstates every record in the table."""
+	@database_cache(db, name='aliased')
+	def one(x: int) -> bytes:
+		return bytes(100)
+
+	@database_cache(db, name='composite')
+	def two(x: int, y: int) -> bytes:
+		return bytes(100)
+
+	one(1_000_000)
+	two(1_000_000, 1)
+	aliased = {n: mx for n, _m, mx in stats(one).columns}
+	composite = {n: mx for n, _m, mx in stats(two).columns}
+	assert aliased['x'] == 0, 'the rowid alias should cost no record bytes'
+	assert composite['x'] == 3, 'a composite key really is stored in the record'
+	assert stats(one).max_record < stats(two).max_record
 
 
 def test_stats_sizes_integers_by_magnitude_not_digits(db):
