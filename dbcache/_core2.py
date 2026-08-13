@@ -23,6 +23,9 @@ from datetime import timedelta
 from types import NoneType, UnionType
 
 _EMPTY = inspect.Parameter.empty
+# Distinguishes "no per-call max_age given" from an explicit max_age=None,
+# which means the same thing it means on the decorator: never expire.
+_UNSET = object()
 
 # __call__ forwards **kwargs to the wrapped function, so a parameter sharing a
 # name with one of the cache's own keyword arguments would be swallowed as one
@@ -53,7 +56,8 @@ def database_cache(file, name=None, max_age=None, max_size=None):
 	The wrapped function gains three per-call keyword arguments: refresh=True
 	recomputes and overwrites the entry, cache_only=True raises CacheMiss
 	instead of ever calling the function, and max_age overrides the cache-wide
-	setting for that one call.
+	setting for that one call -- including max_age=None to accept an entry of
+	any age from a cache that normally expires them.
 	"""
 	def decorate(func):
 		return DatabaseCache(func, file, name, max_age, max_size)
@@ -96,7 +100,11 @@ class DatabaseCache:
 
 		# get_type_hints resolves string annotations (`from __future__ import annotations`)
 		hints = typing.get_type_hints(func, include_extras=True)
-		self.input_columns = [Column(p, hints.get(p, _EMPTY)) for p in self.signature.parameters]
+		# read_back=False: a parameter is written to the key columns and compared
+		# against them, but never turned back into a Python value, so a one-way
+		# serializer is all it needs
+		self.input_columns = [
+			Column(p, hints.get(p, _EMPTY), read_back=False) for p in self.signature.parameters]
 		nullable = [col.name for col in self.input_columns if col.nullable]
 		if nullable:
 			raise ValueError(
@@ -143,9 +151,12 @@ class DatabaseCache:
 		# Deleting by rowid is what lets the index above do its job. Naming the
 		# key columns in the ORDER BY instead defeats it -- they are not in the
 		# index, so SQLite gives up and sorts the whole table on every single
-		# eviction. LIMIT keeps the delete exact however many timestamps tie,
-		# and the index's own (timestamp, rowid) order breaks those ties by
-		# insertion order, so the oldest entry really does go first.
+		# eviction. LIMIT keeps the delete exact however many timestamps tie.
+		# Which member of a tied group goes first is deterministic but not
+		# meaningful: it is rowid order, and the rowid is an insertion counter
+		# except when a lone int parameter has been aliased to it, in which
+		# case it is that parameter. Entries sharing a timestamp are the same
+		# age, so any of them is an equally correct choice.
 		self.evict_cmd = (
 			f"DELETE FROM {self.qtable} WHERE rowid IN "
 			f"(SELECT rowid FROM {self.qtable} ORDER BY timestamp LIMIT ?)")
@@ -155,7 +166,7 @@ class DatabaseCache:
 			self.evict(self.size - self.max_size)
 			self.vacuum()
 
-	def __call__(self, *args, refresh=False, cache_only=False, max_age=None, **kwargs):
+	def __call__(self, *args, refresh=False, cache_only=False, max_age=_UNSET, **kwargs):
 		if refresh and cache_only:
 			raise ValueError('refresh=True and cache_only=True are contradictory')
 
@@ -165,7 +176,8 @@ class DatabaseCache:
 		cached = self.fetch(key)
 		if cached is not None and not refresh:
 			*outputs, timestamp = cached
-			if time.time() - timestamp <= (self.max_age if max_age is None else as_seconds(max_age)):
+			limit = self.max_age if max_age is _UNSET else as_seconds(max_age)
+			if time.time() - timestamp <= limit:
 				return self.codec.decode(outputs)
 		if cache_only:
 			raise CacheMiss(args, kwargs)
@@ -335,11 +347,28 @@ class CacheStats:
 		return "\n".join(lines)
 
 
+# Widest value each integer serial type holds. 0 and 1 have dedicated serial
+# types and occupy no bytes at all, and a float is always 8.
+INT_BOUNDS = ((127, 1), (32767, 2), (8388607, 3), (2147483647, 4), (140737488355327, 6))
+
+
 def size_expr(column):
-	"""SQL for the bytes one value of a column occupies. NULL occupies none."""
+	"""SQL for the bytes one stored value occupies. A NULL occupies none.
+
+	Measured, not estimated: an integer takes as many bytes as its magnitude
+	needs, which is not how many digits it prints -- a timestamp is 4 bytes and
+	ten characters. length(cast(x AS BLOB)) rather than octet_length() because
+	length() alone counts characters for text, and octet_length() only exists
+	from SQLite 3.43 (2023), which requires-python = ">=3.12" does not promise.
+	"""
+	col = column.quoted
 	if column.sql_type in ('TEXT', 'BLOB'):
-		return f"coalesce(octet_length({column.quoted}), 0)"
-	return f"min(8, coalesce(octet_length({column.quoted}), 0))"
+		return f"coalesce(length(cast({col} AS BLOB)), 0)"
+	if column.sql_type == 'REAL':
+		return f"(CASE WHEN {col} IS NULL THEN 0 ELSE 8 END)"
+	widths = ' '.join(f"WHEN {col} BETWEEN {-bound - 1} AND {bound} THEN {width}"
+	                  for bound, width in INT_BOUNDS)
+	return f"(CASE WHEN {col} IS NULL OR {col} IN (0, 1) THEN 0 {widths} ELSE 8 END)"
 
 
 def record_bytes(columns, sizes):
@@ -367,12 +396,14 @@ class Column:
 	"""One table column: a name, an SQLite type, and how values pass through.
 
 	The type is taken from an annotation. `T | None` makes the column nullable.
-	`Annotated[T, serialize]` or `Annotated[T, (serialize, deserialize)]` passes
-	values through the given functions; the column then stores whatever the
-	serializer's return annotation says.
+	`Annotated[T, (serialize, deserialize)]` passes values through the given
+	functions; the column then stores whatever the serializer's return
+	annotation says. `Annotated[T, serialize]` gives only the one direction,
+	which is allowed on a column that is never read back -- pass read_back=False
+	to say so.
 	"""
 
-	def __init__(self, name, annotation):
+	def __init__(self, name, annotation, *, read_back=True):
 		if annotation is _EMPTY:
 			raise ValueError(f"type of {name} must be given")
 		self.name = name
@@ -380,7 +411,7 @@ class Column:
 		self.serialize = self.deserialize = identity
 		if typing.get_origin(annotation) is typing.Annotated:
 			_base, *extras = typing.get_args(annotation)
-			self.serialize, self.deserialize = read_serializer(name, extras)
+			self.serialize, self.deserialize = read_serializer(name, extras, read_back)
 			try:
 				annotation = typing.get_type_hints(self.serialize)['return']
 			except (KeyError, TypeError, AttributeError):
@@ -398,20 +429,27 @@ class Column:
 		return f"{self.quoted} {self.sql_type}" + ("" if self.nullable else " NOT NULL")
 
 
-def read_serializer(name, extras):
+def read_serializer(name, extras, read_back):
 	"""The (serialize, deserialize) pair from Annotated metadata.
 
-	A lone function only serializes: a cache hit then yields the stored form
-	as-is. A pair converts both ways.
+	A pair converts both ways. A lone function converts only on the way in,
+	which is enough for a column that is never read back, and wrong for one
+	that is -- a cache hit would hand the caller the stored form instead of
+	the value the function actually returned.
 	"""
 	match extras:
-		case [serialize] if callable(serialize):
-			return serialize, identity
 		case [(serialize, deserialize)] if callable(serialize) and callable(deserialize):
 			return serialize, deserialize
+		case [serialize] if callable(serialize):
+			if not read_back:
+				return serialize, identity
+			raise ValueError(
+				f"the annotation on {name} needs both directions: this value is read back "
+				f"on a cache hit, so a lone serializer would return the stored form rather "
+				f"than the real value. Give a (serialize, deserialize) pair.")
 	raise ValueError(
-		f"the annotation on {name} must be a single serializer function or a "
-		f"(serialize, deserialize) pair, got {extras!r}")
+		f"the annotation on {name} must be a (serialize, deserialize) pair"
+		f"{'' if read_back else ' or a single serializer function'}, got {extras!r}")
 
 
 def split_optional(annotation):
