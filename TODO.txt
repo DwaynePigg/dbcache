@@ -2,4 +2,8 @@ do I care about __future__?
 
 How does the primary key lookup work?
 
-stats: total
+annotationlib
+
+How is 0 size possible?
+
+sentinel()
