@@ -260,8 +260,7 @@ class Codec:
 		return [col.serialize(v) for col, v in zip(self.columns, self.split(value), strict=True)]
 
 	def decode(self, values):
-		elements = [col.deserialize(v) for col, v in zip(self.columns, values, strict=True)]
-		return self.join(elements)
+		return self.join(col.deserialize(v) for col, v in zip(self.columns, values, strict=True))
 
 
 def make_codec(return_type):

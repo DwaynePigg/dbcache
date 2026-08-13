@@ -1,3 +1,5 @@
-Let's get rid of qtable, just use escaped version
-
 do I care about __future__?
+
+How does the primary key lookup work?
+
+stats: total
