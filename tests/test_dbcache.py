@@ -1,7 +1,9 @@
-"""Regression tests.
+"""The _core regression suite, ported to _core2.
 
-Every test marked REGRESSION pins a bug that was present before the src-layout
-rewrite; each one failed against the original dbcache.py.
+Dropped: stats()/record-size tests, the rowid flag tests, the evict_batch
+tests and the ABC test -- those features were deliberately removed. Eviction
+expectations changed: the cache now never exceeds max_size and evicts exactly
+the overage, not a batch.
 """
 import sqlite3
 import time
@@ -11,10 +13,7 @@ from typing import Annotated
 
 import pytest
 
-from dbcache import CacheMiss, database_cache
-from dbcache._core import (
-	Cache, DataclassCodec, ScalarCodec, TupleCodec,
-	build_codec, max_local, record_size, serial_type)
+from dbcache._core import CacheMiss, database_cache, make_codec
 
 
 @pytest.fixture
@@ -24,10 +23,8 @@ def db(tmp_path):
 
 # --- eviction -----------------------------------------------------------------
 
-def test_eviction_removes_exactly_the_batch(db):
-	"""REGRESSION: OFFSET n landed on the n+1'th oldest row and `<=` included
-	it, so eviction always removed one row too many."""
-	@database_cache(db, max_size=10, evict_batch=3)
+def test_eviction_removes_only_the_oldest(db):
+	@database_cache(db, max_size=10)
 	def f(x: int) -> int:
 		return x * 2
 
@@ -38,17 +35,17 @@ def test_eviction_removes_exactly_the_batch(db):
 	f.conn.commit()
 	assert len(f.contents()) == 10
 
-	f(100)  # the 11th entry trips eviction; its timestamp is now(), so newest
-	assert len(f.contents()) == 8
-	assert f.size == 8
-	assert {row[0] for row in f.contents()} == {3, 4, 5, 6, 7, 8, 9, 100}
+	f(100)  # the 11th entry evicts exactly one row: the oldest
+	assert len(f.contents()) == 10
+	assert f.size == 10
+	assert {row[0] for row in f.contents()} == {1, 2, 3, 4, 5, 6, 7, 8, 9, 100}
 
 
 def test_eviction_is_exact_when_every_timestamp_ties(db):
-	"""REGRESSION: timestamps are whole seconds, so a burst written inside one
-	second all tied and `timestamp <= cutoff` emptied the entire table. Deleting
-	by key caps the count at LIMIT, so ties cannot widen the delete."""
-	@database_cache(db, max_size=10, evict_batch=3)
+	"""Timestamps are whole seconds, so a burst written inside one second all
+	ties. Deleting by key caps the count at LIMIT, so ties cannot widen the
+	delete."""
+	@database_cache(db, max_size=10)
 	def f(x: int) -> int:
 		return x * 2
 
@@ -58,21 +55,33 @@ def test_eviction_is_exact_when_every_timestamp_ties(db):
 	f.conn.commit()
 
 	f(100)
-	assert len(f.contents()) == 8
-	assert f.size == 8
+	assert len(f.contents()) == 10
+	assert f.size == 10
 
 
 def test_eviction_survives_a_real_burst(db):
 	"""The same scenario without forcing it: entries written as fast as the loop
 	allows share a wall-clock second."""
-	@database_cache(db, max_size=10, evict_batch=3)
+	@database_cache(db, max_size=10)
 	def f(x: int) -> int:
 		return x * 2
 
 	for i in range(11):
 		f(i)
 	assert len({row[-1] for row in f.contents()}) <= 2  # they really did tie
-	assert len(f.contents()) == 8
+	assert len(f.contents()) == 10
+
+
+def test_cache_never_exceeds_max_size(db):
+	@database_cache(db, max_size=4)
+	def f(x: int) -> int:
+		return x
+
+	for i in range(10):
+		f(i)
+		assert len(f.contents()) <= 4
+	assert len(f.contents()) == 4
+	assert f.size == 4
 
 
 def test_evict_beyond_table_size_empties_it(db):
@@ -88,7 +97,7 @@ def test_evict_beyond_table_size_empties_it(db):
 
 
 def test_timestamp_is_a_whole_second(db):
-	"""The column is a 4-byte int, not an 8-byte REAL."""
+	"""The column is a small int, not an 8-byte REAL."""
 	@database_cache(db, max_age=60)
 	def f(x: int) -> int:
 		return x
@@ -100,171 +109,34 @@ def test_timestamp_is_a_whole_second(db):
 	assert stored <= time.time()
 
 
-# --- table layout --------------------------------------------------------------
-
-def test_rowid_flag_changes_the_layout(db):
-	@database_cache(db, name="wor")
-	def a(x: int) -> int:
-		return x
-
-	@database_cache(db, name="rid", rowid=True)
-	def b(x: int) -> int:
-		return x
-
-	def sql(name):
-		return a.conn.execute(
-			"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()[0]
-
-	assert sql("wor").rstrip().endswith("WITHOUT ROWID")
-	assert not sql("rid").rstrip().endswith("WITHOUT ROWID")
-	assert b(3) == 3 and b(3) == 3  # and it still works
-
-
-def test_rowid_mismatch_is_rejected(db):
-	"""CREATE TABLE IF NOT EXISTS silently no-ops on an existing table, so
-	flipping the flag would otherwise look like it worked and change nothing."""
-	@database_cache(db, name="t")
-	def a(x: int) -> int:
-		return x
-
-	a(1)
-	a.close()
-
-	with pytest.raises(ValueError, match="rowid-ness cannot be changed"):
-		@database_cache(db, name="t", rowid=True)
-		def b(x: int) -> int:
-			return x
-
-
-def test_eviction_works_on_a_rowid_table(db):
-	@database_cache(db, max_size=10, evict_batch=3, rowid=True)
+def test_every_cache_has_a_timestamp_column(db):
+	"""The unification: no max_age/max_size needed for the column to exist."""
+	@database_cache(db)
 	def f(x: int) -> int:
-		return x * 2
+		return x
 
-	for i in range(10):
-		f(i)
-	f.conn.execute('UPDATE "f" SET timestamp = 1700000000')
-	f.conn.commit()
-	f(100)
-	assert len(f.contents()) == 8
+	f(1)
+	assert f.conn.execute('SELECT timestamp FROM "f"').fetchone() is not None
 
 
-# --- stats ---------------------------------------------------------------------
+# --- codec ---------------------------------------------------------------------
 
-def test_record_size_matches_sqlite_serial_types():
-	assert serial_type(None) == (0, 0)
-	assert serial_type(0) == (8, 0)      # constants cost no body bytes
-	assert serial_type(1) == (9, 0)
-	assert serial_type(200) == (2, 2)
-	assert serial_type(1786560274) == (4, 4)     # int timestamp
-	assert serial_type(1786560274.5) == (7, 8)   # REAL is always 8
-	assert serial_type(b'abc') == (18, 3)
-	assert serial_type('abc') == (19, 3)
-	# 2 one-byte columns + 1 header-length byte
-	assert record_size([200, 200]) == 3 + 4
-
-
-def test_build_codec_round_trips_without_a_database():
-	"""The point of the extraction: return-type handling is now reachable
-	without a connection, a table, or any SQL."""
+def test_make_codec_round_trips_without_a_database():
 	@dataclass
 	class P:
 		a: int
 		b: str
 
 	for return_type, value in ((int, 7), (tuple[int, str], (7, 'x')), (P, P(7, 'x'))):
-		codec = build_codec(return_type)
-		row = []
-		codec.concat(row, value)
+		codec = make_codec(return_type)
+		row = codec.encode(value)
 		assert len(row) == len(codec.columns)
-		assert codec.compose(row) == value
+		assert codec.decode(row) == value
 
 
-def test_build_codec_dispatch():
-	@dataclass
-	class P:
-		a: int
-		b: str
-
-	assert type(build_codec(int)) is ScalarCodec
-	assert type(build_codec(tuple[int, str])) is TupleCodec
-	assert type(build_codec(P)) is DataclassCodec
-	# the specialisation is real, not just a naming convention
-	assert isinstance(build_codec(P), TupleCodec)
-
-
-def test_max_local_formulas():
-	assert max_local(4096, rowid=True) == 4061
-	assert max_local(4096, rowid=False) == 1002
-	assert max_local(8192, rowid=False) == 2030
-
-
-def test_stats_reports_headroom(db):
-	@database_cache(db, max_age=60)
-	def small(x: int) -> int:
-		return x * 2
-
-	for i in range(5):
-		small(i)
-	s = small.stats()
-	assert s.rows == 5
-	assert not s.overflowing
-	assert s.max_local == 1002
-	assert s.headroom > 900
-	assert "headroom" in str(s)
-
-
-def test_stats_detects_overflow(db):
-	@database_cache(db)
-	def big(x: int) -> bytes:
-		return bytes(3000)  # far past maxLocal for a WITHOUT ROWID table
-
-	big(1)
-	s = big.stats()
-	assert s.overflowing
-	assert s.max_record > s.max_local
-	assert "OVERFLOWING" in str(s)
-	assert "rowid=True" in str(s)  # and it suggests the fix
-
-
-def test_stats_on_rowid_table_has_more_headroom(db):
-	@database_cache(db, name="t", rowid=True)
-	def big(x: int) -> bytes:
-		return bytes(3000)
-
-	big(1)
-	s = big.stats()
-	assert not s.overflowing  # 3000 < 4061
-	assert s.max_local == 4061
-
-
-def test_default_evict_batch_is_five_percent(db):
-	"""Proportional keeps the amortised scan cost flat as the cache grows; 5%
-	rather than a larger share because the batch is capacity given up and the
-	scan it saves costs only microseconds."""
-	@database_cache(db, max_size=1000)
-	def f(x: int) -> int:
-		return x
-
-	assert f.evict_batch == 50
-
-
-def test_eviction_batch_is_never_zero(db):
-	"""REGRESSION: int(0.2 * max_size) is 0 for max_size < 5, so eviction
-	deleted nothing and the cache stayed permanently over its limit."""
-	@database_cache(db, max_size=4)
-	def f(x: int) -> int:
-		return x
-
-	for i in range(10):
-		f(i)
-	assert f.evict_batch == 1
-	assert len(f.contents()) <= 4
-
+# --- size management ------------------------------------------------------------
 
 def test_max_size_can_shrink_between_runs(db):
-	"""REGRESSION: evict() ran before evict_cmd was assigned (AttributeError),
-	and the vacuum() that followed hit "cannot VACUUM from within a transaction"."""
 	@database_cache(db, name="f", max_size=100)
 	def f(x: int) -> int:
 		return x * 2
@@ -282,8 +154,6 @@ def test_max_size_can_shrink_between_runs(db):
 
 
 def test_vacuum_after_delete(db):
-	"""REGRESSION: vacuum() committed after the VACUUM, so a preceding DELETE
-	left a transaction open and VACUUM raised OperationalError."""
 	@database_cache(db, max_size=10)
 	def f(x: int) -> int:
 		return x
@@ -295,11 +165,19 @@ def test_vacuum_after_delete(db):
 	assert len(f.contents()) == 3
 
 
+def test_len(db):
+	@database_cache(db)
+	def f(x: int) -> int:
+		return x
+
+	for i in range(5):
+		f(i)
+	assert len(f) == 5
+
+
 # --- SQL identifier quoting ---------------------------------------------------
 
 def test_sql_keyword_as_function_and_parameter_name(db):
-	"""REGRESSION: identifiers were interpolated raw, so `add` and `order`
-	produced `OperationalError: near "add": syntax error`."""
 	@database_cache(db)
 	def add(order: int, group: str) -> int:
 		return order
@@ -309,7 +187,7 @@ def test_sql_keyword_as_function_and_parameter_name(db):
 
 
 def test_quote_in_table_name(db):
-	"""REGRESSION: a caller-supplied name was an injection vector."""
+	"""A caller-supplied name must not be an injection vector."""
 	@database_cache(db, name='we"ird name')
 	def f(x: int) -> int:
 		return x
@@ -318,11 +196,20 @@ def test_quote_in_table_name(db):
 	assert f(1) == 1
 
 
+def test_quote_in_table_name_with_max_size(db):
+	"""The eviction index name is derived from the table name; quote it too."""
+	@database_cache(db, name='we"ird name', max_size=2)
+	def f(x: int) -> int:
+		return x
+
+	for i in range(5):
+		f(i)
+	assert len(f.contents()) == 2
+
+
 # --- value round-tripping -----------------------------------------------------
 
 def test_bool_round_trips(db):
-	"""REGRESSION: bool was stored as INTEGER and read back as 0/1, so a cache
-	hit returned int where the fresh call returned bool."""
 	@database_cache(db)
 	def is_even(x: int) -> bool:
 		return x % 2 == 0
@@ -334,7 +221,6 @@ def test_bool_round_trips(db):
 
 
 def test_nullable_bool_round_trips(db):
-	"""REGRESSION: a nullable bool must come back None, not False."""
 	@database_cache(db)
 	def maybe(x: int) -> bool | None:
 		return None if x == 0 else x > 0
@@ -380,8 +266,6 @@ def test_nullable_output(db):
 
 
 def test_nullable_input_rejected(db):
-	"""REGRESSION: an optional parameter is part of the WITHOUT ROWID primary
-	key, so this used to fail at call time with a bare IntegrityError."""
 	with pytest.raises(ValueError, match="cannot be nullable"):
 		@database_cache(db)
 		def f(x: int | None) -> str:
@@ -403,8 +287,6 @@ def test_nullable_input_via_annotated_is_allowed(db):
 
 
 def test_future_annotations(db):
-	"""REGRESSION: `from __future__ import annotations` makes every annotation a
-	string, which failed with "unsupported type: 'int'"."""
 	from _future_annotations import Point, build
 
 	make = build(db)
@@ -415,8 +297,6 @@ def test_future_annotations(db):
 # --- keyword arguments --------------------------------------------------------
 
 def test_keyword_arguments(db):
-	"""REGRESSION: __call__ took only *args, so a keyword call raised
-	`TypeError: got an unexpected keyword argument`."""
 	calls = []
 
 	@database_cache(db)
@@ -443,8 +323,6 @@ def test_defaults_are_applied(db):
 
 
 def test_keyword_only_parameter(db):
-	"""REGRESSION: a keyword-only parameter decorated fine but was uncallable by
-	any spelling -- both f(1, b=2) and f(1, 2) raised TypeError."""
 	@database_cache(db)
 	def f(a: int, *, b: int) -> int:
 		return a + b
@@ -465,8 +343,6 @@ def test_positional_only_parameter(db):
 
 
 def test_var_positional_rejected(db):
-	"""REGRESSION: *args has no fixed arity, so this decorated cleanly and then
-	failed at call time with `type 'tuple' is not supported`."""
 	with pytest.raises(ValueError, match="variadic"):
 		@database_cache(db)
 		def f(*xs: int) -> int:
@@ -474,7 +350,6 @@ def test_var_positional_rejected(db):
 
 
 def test_var_keyword_rejected(db):
-	"""REGRESSION: as above, failing with `type 'dict' is not supported`."""
 	with pytest.raises(ValueError, match="variadic"):
 		@database_cache(db)
 		def f(a: int, **kw: int) -> int:
@@ -482,12 +357,20 @@ def test_var_keyword_rejected(db):
 
 
 def test_reserved_parameter_names_rejected(db):
-	"""REGRESSION: a parameter named max_age/refresh/cache_only was silently
-	swallowed as a control flag now that **kwargs are forwarded."""
+	"""A parameter named max_age/refresh/cache_only would be silently swallowed
+	as a control flag, since **kwargs are forwarded."""
 	with pytest.raises(ValueError, match="reserved"):
 		@database_cache(db, max_age=60)
 		def fetch(url: str, max_age: int) -> str:
 			return url
+
+
+def test_timestamp_parameter_rejected(db):
+	"""New in _core2: every table has a timestamp column, so the name is taken."""
+	with pytest.raises(ValueError, match="reserved"):
+		@database_cache(db)
+		def f(timestamp: int) -> int:
+			return timestamp
 
 
 # --- error reporting ----------------------------------------------------------
@@ -504,9 +387,6 @@ def test_missing_table_reports_signature_change(db):
 
 
 def test_changed_return_type_reports_signature_change(db):
-	"""REGRESSION: quoting every identifier exposed SQLite's double-quoted
-	string-literal misfeature. The missing columns were read as literals, so this
-	returned P(a='return$0', b='return$1') without ever calling the function."""
 	@database_cache(db, name="f")
 	def v1(x: int) -> int:
 		return x * 100
@@ -528,13 +408,11 @@ def test_changed_return_type_reports_signature_change(db):
 
 	# the error names both signatures
 	assert "signature has changed" in str(exc.value)
-	assert "cached: x INTEGER, return INTEGER" in str(exc.value)
-	assert "wanted: x INTEGER, return$0 INTEGER, return$1 INTEGER" in str(exc.value)
+	assert "cached: x INTEGER, return INTEGER, timestamp INTEGER" in str(exc.value)
+	assert "wanted: x INTEGER, return$0 INTEGER, return$1 INTEGER, timestamp INTEGER" in str(exc.value)
 
 
 def test_renamed_parameter_reports_signature_change(db):
-	"""REGRESSION: as above, but the missing column sat in the WHERE clause,
-	where it silently compared a string literal and reported a cache miss."""
 	@database_cache(db, name="f")
 	def v1(x: int) -> int:
 		return x
@@ -551,8 +429,6 @@ def test_renamed_parameter_reports_signature_change(db):
 
 
 def test_other_operational_errors_are_not_disguised(db):
-	"""REGRESSION: every OperationalError was reported as a signature change,
-	hiding "database is locked", disk I/O errors and the like."""
 	@database_cache(db)
 	def h(x: int) -> int:
 		return x
@@ -564,13 +440,6 @@ def test_other_operational_errors_are_not_disguised(db):
 	h.conn = Locked()
 	with pytest.raises(sqlite3.OperationalError, match="locked"):
 		h(1)
-
-
-def test_cache_is_abstract():
-	"""REGRESSION: Cache subclassed ABC but declared nothing abstract, so it was
-	directly instantiable despite having no __call__."""
-	with pytest.raises(TypeError):
-		Cache(lambda x: x, ":memory:", "t")
 
 
 def test_missing_return_annotation_rejected(db):
@@ -594,6 +463,18 @@ def test_bare_tuple_return_rejected(db):
 			return (x,)
 
 
+def test_nonpositive_settings_rejected(db):
+	with pytest.raises(ValueError, match="max_age must be positive"):
+		@database_cache(db, max_age=0)
+		def f(x: int) -> int:
+			return x
+
+	with pytest.raises(ValueError, match="max_size must be positive"):
+		@database_cache(db, max_size=0)
+		def g(x: int) -> int:
+			return x
+
+
 # --- cache_only / max_age -----------------------------------------------------
 
 def test_cache_only_raises_on_miss(db):
@@ -608,8 +489,6 @@ def test_cache_only_raises_on_miss(db):
 
 
 def test_refresh_with_cache_only_is_rejected(db):
-	"""REGRESSION: this combination silently called the function, the exact
-	opposite of what cache_only asks for."""
 	@database_cache(db)
 	def f(x: int) -> int:
 		return x
@@ -634,9 +513,6 @@ def test_refresh_recomputes(db):
 
 
 def test_explicit_refresh_does_not_grow_size(db):
-	"""refresh skips the freshness check but not the lookup: `cached_output is
-	None` is what tells the size accounting a write adds a row rather than
-	replacing one, so skipping it would count every refresh as growth."""
 	@database_cache(db, max_size=10)
 	def f(x: int) -> int:
 		return x
@@ -649,8 +525,7 @@ def test_explicit_refresh_does_not_grow_size(db):
 
 
 def test_control_flags_are_uniform_across_cache_types(tmp_path):
-	"""The point of `refresh`: which subclass database_cache picks is a
-	decoration-time detail, so the per-call API must not depend on it."""
+	"""One class now, but the per-call API must stay independent of the settings."""
 	@database_cache(tmp_path / "a.db")
 	def simple(x: int) -> int:
 		return x
@@ -705,6 +580,25 @@ def test_per_call_max_age_override(db):
 	assert calls == [1, 1]
 
 
+def test_per_call_max_age_on_an_unlimited_cache(db):
+	"""max_age is a per-call flag even when the decorator set no default."""
+	calls = []
+
+	@database_cache(db)
+	def f(x: int) -> int:
+		calls.append(x)
+		return x
+
+	f(1)
+	f.conn.execute('UPDATE "f" SET timestamp = timestamp - 300')
+	f.conn.commit()
+
+	f(1)  # no default limit: still a hit
+	assert calls == [1]
+	f(1, max_age=10)  # stale under an explicit window
+	assert calls == [1, 1]
+
+
 def test_max_age_accepts_timedelta(db):
 	@database_cache(db, max_age=timedelta(hours=1))
 	def f(x: int) -> int:
@@ -745,21 +639,21 @@ def test_annotated_serializer_pair(db):
 	assert f(3) == (0, 1, 2)
 
 
-def test_annotated_serializer_only(db):
-	"""Characterises the serializer-only form: deserialize is identity, so a
-	cache hit yields the stored representation rather than the original value."""
+def test_serializer_only_rejected_on_a_return_type(db):
+	"""A return value is read back on every hit, so a one-way serializer would
+	make the cached call return the stored form instead of the real value --
+	f(3) == 6 fresh but f(3) == "6" on the hit. Reject it at decoration time."""
 	def as_text(v: object) -> str:
 		return str(v)
 
-	@database_cache(db)
-	def f(n: int) -> Annotated[object, as_text]:
-		return n * 2
-
-	assert f(3) == 6  # fresh call, real value
-	assert f(3) == "6"  # cache hit, stored representation
+	with pytest.raises(ValueError, match="needs both directions"):
+		@database_cache(db)
+		def f(n: int) -> Annotated[object, as_text]:
+			return n * 2
 
 
 def test_annotated_on_input(db):
+	"""A parameter is never read back, so one direction is all it needs."""
 	@database_cache(db)
 	def f(v: Annotated[tuple, to_csv]) -> int:
 		return sum(v)
@@ -768,27 +662,36 @@ def test_annotated_on_input(db):
 	assert f((1, 2, 3)) == 6
 
 
+def test_serializer_pair_on_input_is_also_fine(db):
+	@database_cache(db)
+	def f(v: Annotated[tuple, (to_csv, from_csv)]) -> int:
+		return sum(v)
+
+	assert f((1, 2, 3)) == 6
+	assert f((1, 2, 3)) == 6
+
+
 def test_annotated_with_too_much_metadata_rejected(db):
-	"""REGRESSION: this died on an opaque tuple-unpack ValueError."""
-	with pytest.raises(ValueError, match="single serializer annotation"):
+	with pytest.raises(ValueError, match="serialize, deserialize"):
 		@database_cache(db)
 		def f(n: int) -> Annotated[int, to_csv, from_csv]:
 			return n
 
 
 def test_annotated_with_unsized_metadata_rejected(db):
-	"""REGRESSION: len(meta) raised TypeError instead of the intended ValueError."""
-	with pytest.raises(ValueError, match="serializer function"):
+	with pytest.raises(ValueError, match="serialize, deserialize"):
 		@database_cache(db)
 		def f(n: int) -> Annotated[int, 5]:
 			return n
 
 
 def test_serializer_without_return_type_rejected(db):
-	with pytest.raises(ValueError, match="serializer must have return type"):
+	"""On a parameter, where the one-way form is legal, so this reaches the
+	return-annotation check rather than tripping the pair check first."""
+	with pytest.raises(ValueError, match="must have a return type"):
 		@database_cache(db)
-		def f(n: int) -> Annotated[int, lambda v: str(v)]:
-			return n
+		def f(n: Annotated[int, lambda v: str(v)]) -> int:
+			return 1
 
 
 # --- misc ---------------------------------------------------------------------
@@ -827,3 +730,69 @@ def test_wrapper_metadata_preserved(db):
 
 	assert documented.__name__ == "documented"
 	assert documented.__doc__ == "Doc."
+
+
+def test_wal_is_enabled(db):
+	@database_cache(db)
+	def f(x: int) -> int:
+		return x
+
+	f(1)
+	assert f.conn.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+	assert f(1) == 1  # and reads still work
+
+
+def test_eviction_actually_uses_the_timestamp_index(db):
+	"""The whole point of the index. Naming the key columns in the ORDER BY
+	defeats it, and SQLite silently falls back to sorting the whole table."""
+	@database_cache(db, max_size=100)
+	def f(a: int, b: int) -> int:
+		return a + b
+
+	plan = '\n'.join(
+		row[-1] for row in f.conn.execute(f'EXPLAIN QUERY PLAN {f.evict_cmd}', (1,)))
+	assert 'COVERING INDEX' in plan
+	assert 'TEMP B-TREE FOR ORDER BY' not in plan
+
+
+@pytest.mark.parametrize('name', ['rowid', 'oid', '_rowid_'])
+def test_rowid_parameter_rejected(db, name):
+	"""A column so named shadows the implicit rowid that eviction deletes by,
+	which would silently make evict() delete the wrong rows."""
+	namespace = {}
+	exec(f"def g({name}: int) -> int:\n\treturn {name}\n", namespace)
+	with pytest.raises(ValueError, match='reserved'):
+		database_cache(db)(namespace['g'])
+
+
+def test_eviction_order_is_oldest_first(db):
+	@database_cache(db, max_size=3)
+	def f(x: int) -> int:
+		return x
+
+	for i in range(3):
+		f(i)
+	f.conn.execute('UPDATE "f" SET timestamp = 1700000000 + "x"')  # 0 oldest
+	f.conn.commit()
+	f(99)
+	assert {row[0] for row in f.contents()} == {1, 2, 99}
+
+
+def test_per_call_max_age_none_accepts_any_age(db):
+	"""max_age=None per call means what it means on the decorator: no limit."""
+	calls = []
+
+	@database_cache(db, max_age=60)
+	def f(x: int) -> int:
+		calls.append(x)
+		return x
+
+	f(1)
+	f.conn.execute('UPDATE "f" SET timestamp = timestamp - 6000')
+	f.conn.commit()
+	f(1)                 # stale under the cache's own 60s limit
+	assert calls == [1, 1]
+	f.conn.execute('UPDATE "f" SET timestamp = timestamp - 6000')
+	f.conn.commit()
+	f(1, max_age=None)   # explicitly asking for an entry of any age
+	assert calls == [1, 1]

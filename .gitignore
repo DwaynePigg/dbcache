@@ -3,3 +3,7 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+
+# cache databases, plus the -wal/-shm sidecars WAL mode keeps beside them
+*.db*
+*.sqlite*

@@ -5,9 +5,11 @@ name = "dbcache"
 version = "0.1.0"
 description = "SQLite-backed function cache decorator"
 readme = "README.md"
-# 3.12 is a hard floor, not a preference: the SQL builders use PEP 701 f-strings
-# (same quote character nested inside an interpolation), which earlier versions
-# cannot parse at all.
+# 3.12 is a hard floor, not a preference: Connection.setconfig and the
+# SQLITE_DBCONFIG_DQS_* constants arrived in 3.12, and turning double-quoted
+# string literals off is what stops a missing column being read as its own name
+# instead of raising. Nothing here needs 3.12 *syntax* -- both modules parse as
+# 3.10 -- so the floor moves only if that guard finds another home.
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
