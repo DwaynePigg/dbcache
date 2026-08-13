@@ -1,456 +1,292 @@
+"""SQLite-backed function cache.
+
+	@database_cache('cache.db', max_age=timedelta(days=1))
+	def geocode(address: str) -> tuple[float, float]:
+		...
+
+The type annotations define the table: one column per parameter, which
+together form the primary key, one or more `return` columns for the result,
+and a timestamp. Each call looks its arguments up in the table and runs the
+function only on a miss.
+
+Second, slimmer draft of _core; see that file for the history of the edge
+cases handled here. Diagnostics live in _stats, which this file knows nothing
+about.
+"""
 import functools
 import inspect
+import math
 import sqlite3
-import sys
 import time
-import types
 import typing
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, is_dataclass, astuple, fields
+from dataclasses import astuple, fields, is_dataclass
 from datetime import timedelta
-from types import NoneType
+from types import NoneType, UnionType
 
-
-_UNSET = object()
 _EMPTY = inspect.Parameter.empty
+# Distinguishes "no per-call max_age given" from an explicit max_age=None,
+# which means the same thing it means on the decorator: never expire.
+_UNSET = object()
 
-# FIX: __call__ now forwards **kwargs to the wrapped function (keyword arguments
-# used to raise TypeError). That makes a parameter sharing a name with one of the
-# cache's own flags ambiguous -- it would be swallowed as a flag and silently
-# produce a wrong cache key. Reject it loudly at decoration time instead. All
-# three names are reserved by both subclasses so that a function does not become
-# un-wrappable just by switching between SimpleCache and TimestampCache.
-_CONTROL_KEYWORDS = frozenset({'refresh', 'cache_only', 'max_age'})
-
-
-def database_cache(file, name=None, max_age=None, max_size=None, evict_batch=None, rowid=False):
-	if max_age is None and max_size is None:
-		return lambda func: SimpleCache(func, file, name, rowid=rowid)
-	return lambda func: TimestampCache(func, file, name, max_age, max_size, evict_batch, rowid=rowid)
+# __call__ forwards **kwargs to the wrapped function, so a parameter sharing a
+# name with one of the cache's own keyword arguments would be swallowed as one
+# and silently corrupt the cache key. `timestamp` would collide with the
+# cache's own column, and a column named `rowid` (or either of its aliases)
+# shadows the implicit one that eviction deletes by. Reject all of them at
+# decoration time, where the message can say so.
+_RESERVED = frozenset({
+	'refresh', 'cache_only', 'max_age', 'timestamp', 'rowid', 'oid', '_rowid_'})
 
 
-class Codec(ABC):
-	"""Maps a return value onto output columns and back.
+def database_cache(file, name=None, max_age=None, max_size=None):
+	"""Cache a function's results in an SQLite database, one call per row.
 
-	Which subclass applies is settled once, by build_codec at decoration time,
-	so no branching on the return shape survives into the call path.
+	Every parameter and the return type must be annotated: the annotations
+	become the table's columns, and the parameters its primary key, so calling
+	again with the same arguments reads the stored result back instead of
+	running the function. Supported types are bool, int, float, str and bytes;
+	`T | None` marks a return column nullable, and Annotated (see Column) maps
+	anything else onto a supported type.
+
+	file: path of the database, shared freely between caches.
+	name: table name, defaulting to the function's own.
+	max_age: seconds (or a timedelta) after which an entry is stale and gets
+		recomputed on its next call. None means entries never expire.
+	max_size: most entries kept; the oldest is evicted to make room.
+
+	The wrapped function gains three per-call keyword arguments: refresh=True
+	recomputes and overwrites the entry, cache_only=True raises CacheMiss
+	instead of ever calling the function, and max_age overrides the cache-wide
+	setting for that one call -- including max_age=None to accept an entry of
+	any age from a cache that normally expires them.
+	"""
+	def decorate(func):
+		return DatabaseCache(func, file, name, max_age, max_size)
+	return decorate
+
+
+class CacheMiss(Exception):
+	"""Raised by a cache_only call when there is no fresh entry.
+
+	Carries the (positional, keyword) arguments of the rejected call.
 	"""
 
-	def __init__(self, columns):
-		self.columns = columns
 
-	@abstractmethod
-	def concat(self, row, value):
-		"""Append `value`, serialized, onto a row being assembled."""
+class DatabaseCache:
+	"""What database_cache wraps a function in: the table and its statements."""
 
-	@abstractmethod
-	def compose(self, values):
-		"""Rebuild the return value from the columns read back."""
-
-
-class ScalarCodec(Codec):
-	"""A single `return` column holding the value itself."""
-
-	def __init__(self, column):
-		super().__init__([column])
-		self.column = column
-
-	def concat(self, row, value):
-		row.append(self.column.serialize(value))
-
-	def compose(self, values):
-		(value,) = values
-		return self.column.deserialize(value)
-
-
-class TupleCodec(Codec):
-	"""One column per element, named `return$0` upward."""
-
-	def concat(self, row, value):
-		row.extend(col.serialize(v) for col, v in zip(self.columns, value, strict=True))
-
-	def compose(self, values):
-		return tuple(col.deserialize(v) for col, v in zip(self.columns, values, strict=True))
-
-
-class DataclassCodec(TupleCodec):
-	"""Tuple-shaped once serialized; only the two ends differ."""
-
-	def __init__(self, columns, return_type):
-		super().__init__(columns)
-		self.return_type = return_type
-
-	def concat(self, row, value):
-		super().concat(row, astuple(value))
-
-	def compose(self, values):
-		return self.return_type(*super().compose(values))
-
-
-def build_codec(return_type):
-	"""Choose the Codec for a return annotation."""
-	if return_type is tuple:
-		raise ValueError('tuple return type must be parameterized')
-
-	if is_dataclass(return_type):
-		# FIX: field.type is whatever was written in the class body, which is a
-		# string under `from __future__ import annotations`. Resolve the
-		# dataclass's hints too, then index them in declared field order.
-		hints = typing.get_type_hints(return_type, include_extras=True)
-		return DataclassCodec(
-			[Column(f"return${i}", hints[f.name]) for i, f in enumerate(fields(return_type))],
-			return_type)
-
-	if typing.get_origin(return_type) is tuple:
-		return TupleCodec(
-			[Column(f"return${i}", a) for i, a in enumerate(typing.get_args(return_type))])
-
-	return ScalarCodec(Column("return", return_type))
-
-
-def quote(identifier):
-	"""Quote an SQL identifier.
-
-	FIX: table and column names were interpolated into SQL raw, so a function
-	named `add` or a parameter named `order` raised OperationalError, and the
-	caller-supplied `name` was an injection vector.
-	"""
-	escaped = identifier.replace('"', '""')
-	return f'"{escaped}"'
-
-
-class Cache(ABC):
-
-	def __init__(self, func, file, name, *, timestamp=False, rowid=False):
+	def __init__(self, func, file, name=None, max_age=None, max_size=None):
+		functools.update_wrapper(self, func)
 		self.func = func
-		self.rowid = rowid
-		self.conn = sqlite3.connect(file)
-		# FIX: SQLite's legacy misfeature reads a double-quoted token that matches
-		# no identifier as a string literal instead of failing. Since every
-		# identifier here is quoted, that turned "no such column" into silently
-		# returning the column *name* as data -- a changed return type would
-		# deserialize 'return$0' as a cached value rather than raising. Turning
-		# DQS off makes quoted tokens strictly identifiers. (Python 3.12+.)
-		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
-		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
-		# Both forms are load-bearing. qtable is interpolated into SQL; the raw
-		# name goes to sqlite_master and pragma_table_info, which take an
-		# identifier as a *bound parameter* and store it unquoted -- passing the
-		# quoted form there matches nothing, silently, rather than erroring.
 		self.table = name or func.__name__
 		self.qtable = quote(self.table)
-		functools.update_wrapper(self, func)
-		sig = inspect.signature(func)
+		self.max_age = as_seconds(max_age)
+		if self.max_age <= 0:
+			raise ValueError(f"max_age must be positive: {max_age!r}")
+		self.max_size = math.inf if max_size is None else max_size
+		if self.max_size <= 0:
+			raise ValueError(f"max_size must be positive: {max_size!r}")
 
-		clashing = sorted(_CONTROL_KEYWORDS.intersection(sig.parameters))
-		if clashing:
-			raise ValueError(f"{self.table} has parameter(s) {clashing} reserved by the cache; rename them")
-
-		# FIX: a row has fixed arity, a variadic parameter does not. One column
-		# was reserved for it and the bound tuple/dict then went straight to
-		# sqlite3, so these decorated cleanly and failed at call time with an
-		# opaque "Error binding parameter N: type 'tuple' is not supported".
-		# Reject the shape up front. (Keyword-only and positional-only
-		# parameters are fine: both have fixed arity and bind normally.)
+		self.signature = inspect.signature(func)
+		reserved = sorted(_RESERVED.intersection(self.signature.parameters))
+		if reserved:
+			raise ValueError(f"{self.table} has parameter(s) {reserved}, which are reserved by the cache; rename them")
 		variadic = [
-			p.name for p in sig.parameters.values()
-			if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)]
+			p.name for p in self.signature.parameters.values()
+			if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
 		if variadic:
 			raise ValueError(
-				f"{self.table} has variadic parameter(s) {variadic}; every parameter must map to "
-				f"one fixed column, so *args and **kwargs cannot be cached")
+				f"{self.table} has variadic parameter(s) {variadic}; every parameter must map onto "
+				f"one column, so *args and **kwargs cannot be cached")
 
-		# FIX: annotations were read straight off __annotations__, so a caller
-		# module using `from __future__ import annotations` (which turns every
-		# annotation into a string) failed with "unsupported type: 'int'".
-		# get_type_hints resolves them; include_extras keeps Annotated intact.
+		# get_type_hints resolves string annotations (`from __future__ import annotations`)
 		hints = typing.get_type_hints(func, include_extras=True)
-		input_columns = [Column(name, hints.get(name, _EMPTY)) for name in sig.parameters]
-
-		# FIX: SQLite requires every PRIMARY KEY column of a WITHOUT ROWID table
-		# to be NOT NULL, so an optional parameter used to blow up at call time
-		# with a bare "NOT NULL constraint failed". Dropping WITHOUT ROWID would
-		# not help: SQLite treats each NULL key as distinct, so the row would be
-		# re-inserted on every call and never hit. Reject it up front instead.
-		nullable_inputs = [col.name for col in input_columns if col.nullable]
-		if nullable_inputs:
+		# read_back=False: a parameter is written to the key columns and compared
+		# against them, but never turned back into a Python value, so a one-way
+		# serializer is all it needs
+		self.input_columns = [
+			Column(p, hints.get(p, _EMPTY), read_back=False) for p in self.signature.parameters]
+		nullable = [col.name for col in self.input_columns if col.nullable]
+		if nullable:
 			raise ValueError(
-				f"{self.table} has optional parameter(s) {nullable_inputs}; parameters form the "
-				f"primary key and cannot be nullable. Use Annotated to map them onto a non-null "
-				f"column if you need it.")
+				f"{self.table} has optional parameter(s) {nullable}; parameters form the primary "
+				f"key and cannot be nullable, since SQL NULL never compares equal and a None "
+				f"argument could never hit. Use Annotated to map None onto a real value instead.")
+		if 'return' not in hints:
+			raise ValueError(f"{self.table}: return type must be given")
+		self.codec = make_codec(hints['return'])
+		self.columns = [*self.input_columns, *self.codec.columns, Column('timestamp', int)]
 
-		try:
-			return_type = hints['return']
-		except KeyError:
-			raise ValueError('return type must be given')
+		self.conn = sqlite3.connect(file)
+		# Off, a double-quoted name that matches no column is an error. On (the
+		# legacy default), SQLite reads it as a string literal, which would turn
+		# a missing column into silently wrong data instead of the ValueError
+		# raised in fetch().
+		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+		self.conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+		# Every call commits, and under the stock settings that commit is by far
+		# the most expensive thing a cached call does -- around 150x the cost of
+		# the lookup and the write together. These two pragmas trade durability
+		# for that: a power failure can cost the last few entries written. For a
+		# cache that is the right trade, since a lost entry is only recomputed.
+		self.conn.execute('PRAGMA journal_mode = WAL')
+		self.conn.execute('PRAGMA synchronous = NORMAL')
 
-		codec = build_codec(return_type)
-		output_columns = codec.columns
-
-		# Whole seconds. Eviction gets its exactness from LIMIT capping the row
-		# count (see evict_cmd), not from timestamps being unique, so sub-second
-		# resolution would buy nothing and cost 4 bytes a row -- REAL is always 8
-		# bytes where an int this size is 4. Truncating also errs the safe way:
-		# the stored value is never later than the real write time, so an entry
-		# expires up to a second early rather than a second late.
-		lookup_columns = [*output_columns, Column('timestamp', int)] if timestamp else output_columns
-		columns = [*input_columns, *lookup_columns]
-
-		# CREATE TABLE IF NOT EXISTS silently does nothing when the table already
-		# exists, so flipping `rowid` against an existing cache would look like it
-		# worked and change nothing. A table's rowid-ness cannot be altered, so
-		# say so rather than pretend.
-		existing = self.conn.execute(
-			"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (self.table,)).fetchone()
-		if existing is not None:
-			was_rowid = not existing[0].upper().rstrip().endswith('WITHOUT ROWID')
-			if was_rowid != rowid:
-				raise ValueError(
-					f"{self.table} already exists as a {'rowid' if was_rowid else 'WITHOUT ROWID'} table "
-					f"but rowid={rowid} was requested; a table's rowid-ness cannot be changed in place, "
-					f"so the cache must be rebuilt")
-
+		key = column_names(self.input_columns)
 		self.conn.execute(
 			f"CREATE TABLE IF NOT EXISTS {self.qtable} "
-			f"({", ".join(col.definition for col in columns)}, "
-			f"PRIMARY KEY({column_names(input_columns)})){"" if rowid else " WITHOUT ROWID"}")
+			f"({', '.join(col.definition for col in self.columns)}, PRIMARY KEY ({key}))")
+		if max_size is not None:
+			# keeps finding the oldest entries cheap as the cache fills
+			self.conn.execute(
+				f"CREATE INDEX IF NOT EXISTS {quote(self.table + '$by_age')} "
+				f"ON {self.qtable} (timestamp)")
 		self.conn.commit()
 
 		self.lookup_cmd = (
-			f"SELECT {column_names(lookup_columns)} "
-			f"FROM {self.qtable} "
-			f"WHERE {" AND ".join(f"{col.quoted}=?" for col in input_columns)}")
-		self.insert_cmd = (
-			f"INSERT INTO {self.qtable} ({column_names(columns)}) "
-			f"VALUES ({", ".join("?" for _ in columns)}) "
-			f"ON CONFLICT({column_names(input_columns)}) "
-			f"DO UPDATE SET {", ".join(f"{col.quoted}=excluded.{col.quoted}" for col in lookup_columns)}")
-		self.signature = sig
-		self.input_columns = input_columns
-		self.columns = columns
-		self.codec = codec
-
-	@abstractmethod
-	def __call__(self, *args, **kwargs):
-		"""FIX: Cache subclassed ABC but declared nothing abstract, so it was
-		directly instantiable despite having no __call__ of its own."""
-
-	def serialize_input(self, args, kwargs):
-		# FIX: kwargs are now bound too. apply_defaults rebuilds `arguments` in
-		# declared parameter order, so this stays aligned with input_columns even
-		# when the caller passes keywords out of order.
-		bound = self.signature.bind(*args, **kwargs)
-		bound.apply_defaults()
-		return [col.serialize(val) for col, val in zip(self.input_columns, bound.arguments.values(), strict=True)]
-
-	def get_cached(self, values):
-		try:
-			return self.conn.execute(self.lookup_cmd, values).fetchone()
-		except sqlite3.OperationalError as e:
-			# FIX: every OperationalError was reported as a signature change,
-			# hiding "database is locked", disk I/O errors and the like. Only a
-			# missing table or column actually implies the signature moved.
-			if str(e).startswith(('no such table', 'no such column')):
-				cached = self.conn.execute(
-					'SELECT name, type FROM pragma_table_info(?)', (self.table,)).fetchall()
-				raise ValueError(
-					f"{self.table} function signature has changed incompatibly\n"
-					f"  cached: {', '.join(f'{n} {t}' for n, t in cached) or '(table is missing)'}\n"
-					f"  wanted: {', '.join(f'{c.name} {c.sql_type}' for c in self.columns)}") from e
-			raise
-
-	def clear(self):
-		self.conn.execute(f"DELETE FROM {self.qtable}")
-		self.conn.commit()
-
-	def vacuum(self):
-		# FIX: VACUUM cannot run inside a transaction and any preceding DELETE
-		# leaves one open, so committing afterwards raised OperationalError.
-		# Commit first so this is safe from every call site.
-		self.conn.commit()
-		self.conn.execute('VACUUM')
-
-	def contents(self):
-		return self.conn.execute(f"SELECT {column_names(self.columns)} FROM {self.qtable}").fetchall()
-
-	def close(self):
-		# FIX: the connection was held for the lifetime of the process with no
-		# way to release it.
-		self.conn.close()
-
-	def stats(self, sample=1000):
-		"""Report how the rows are actually sitting on disk.
-
-		SQLite stores a row whole inside a page only while the record fits in
-		`maxLocal`; past that the tail spills to a chain of overflow pages, each
-		a full page however little of it is used. One byte over the limit can
-		therefore multiply the file size, and nothing in ordinary use makes that
-		visible -- the cache just quietly gets bigger. This surfaces it.
-		"""
-		page_size = self.conn.execute('PRAGMA page_size').fetchone()[0]
-		page_count = self.conn.execute('PRAGMA page_count').fetchone()[0]
-		rows = self.conn.execute(f"SELECT COUNT(*) FROM {self.qtable}").fetchone()[0]
-		sampled = self.conn.execute(
-			f"SELECT {column_names(self.columns)} FROM {self.qtable} LIMIT {int(sample)}").fetchall()
-		sizes = [record_size(row) for row in sampled] or [0]
-		return CacheStats(
-			table=self.table,
-			rowid=self.rowid,
-			rows=rows,
-			page_size=page_size,
-			file_bytes=page_size * page_count,
-			max_record=max(sizes),
-			mean_record=sum(sizes) // len(sizes),
-			max_local=max_local(page_size, self.rowid),
-			sampled=len(sampled))
-
-
-class SimpleCache(Cache):
-
-	def __call__(self, *args, refresh=False, cache_only=False, **kwargs):
-		# FIX: this combination used to skip the lookup and call the function,
-		# the exact opposite of what cache_only asks for.
-		if refresh and cache_only:
-			raise ValueError('refresh=True and cache_only=True are contradictory')
-
-		values = self.serialize_input(args, kwargs)
-		if not refresh:
-			cached_output = self.get_cached(values)
-			if cached_output is not None:
-				return self.codec.compose(cached_output)
-			if cache_only:
-				raise CacheMiss(args, kwargs)
-
-		result = self.func(*args, **kwargs)
-		self.codec.concat(values, result)
-		self.conn.execute(self.insert_cmd, values)
-		self.conn.commit()
-		return result
-
-
-class TimestampCache(Cache):
-
-	def __init__(self, func, file, name, max_age=None, max_size=None, evict_batch=None, *, rowid=False):
-		super().__init__(func, file, name, timestamp=True, rowid=rowid)
-		self.max_age = get_age(max_age)
-		if self.max_age < 1:
-			raise ValueError(f"{max_age=}")
-
-		# FIX: eviction was `DELETE ... WHERE timestamp <= (nth oldest timestamp)`.
-		# With whole-second timestamps every entry written in the same second tied,
-		# and `<=` matched all of them -- a single eviction emptied the table.
-		# (It was also off by one even with distinct timestamps: OFFSET n lands on
-		# the n+1'th row and `<=` includes it.)
-		#
-		# Delete by key instead: the subquery names exactly the `count` oldest rows
-		# and LIMIT caps it, so ties cannot widen the delete no matter how many
-		# entries share a timestamp. Exactness comes from the query rather than
-		# from timestamp resolution, which is what lets the column stay a 4-byte
-		# int. The key is the ORDER BY tiebreak so the choice among equal
-		# timestamps is at least deterministic.
-		pk = column_names(self.input_columns)
+			f"SELECT {column_names(self.codec.columns)}, timestamp FROM {self.qtable} "
+			f"WHERE {' AND '.join(f'{col.quoted} = ?' for col in self.input_columns)}")
+		self.store_cmd = (
+			f"INSERT OR REPLACE INTO {self.qtable} ({column_names(self.columns)}) "
+			f"VALUES ({', '.join('?' for _ in self.columns)})")
+		# Deleting by rowid is what lets the index above do its job. Naming the
+		# key columns in the ORDER BY instead defeats it -- they are not in the
+		# index, so SQLite gives up and sorts the whole table on every single
+		# eviction. LIMIT keeps the delete exact however many timestamps tie.
+		# Which member of a tied group goes first is deterministic but not
+		# meaningful: it is rowid order, and the rowid is an insertion counter
+		# except when a lone int parameter has been aliased to it, in which
+		# case it is that parameter. Entries sharing a timestamp are the same
+		# age, so any of them is an equally correct choice.
 		self.evict_cmd = (
-			f"DELETE FROM {self.qtable} WHERE ({pk}) IN ("
-			f"SELECT {pk} FROM {self.qtable} "
-			f"ORDER BY timestamp ASC, {pk} LIMIT ?)")
+			f"DELETE FROM {self.qtable} WHERE rowid IN "
+			f"(SELECT rowid FROM {self.qtable} ORDER BY timestamp LIMIT ?)")
 
 		self.size = self.conn.execute(f"SELECT COUNT(*) FROM {self.qtable}").fetchone()[0]
-		if not max_size:
-			self.max_size = sys.maxsize
-			self.evict_batch = None
-		else:
-			self.max_size = max_size
-			# 5% of max_size. Eviction pays for an O(n log n) scan however few rows
-			# it actually removes, so batching amortises that scan -- and keeping
-			# the batch proportional holds the per-insert cost flat as the cache
-			# grows, where a fixed batch degrades with size. The cache oscillates
-			# between max_size - evict_batch and max_size, so the batch is also
-			# capacity given up: 5% keeps 97.5% of what was asked for while
-			# amortising to a few microseconds per insert, which is nothing beside
-			# anything expensive enough to be worth caching.
-			# FIX: the old int(0.2 * max_size) was 0 for max_size < 5, so eviction
-			# removed nothing and the cache stayed over its limit forever.
-			self.evict_batch = evict_batch or max(1, max_size // 20)
-			# if max_size changed between runs, reduce the size now
-			# FIX: this ran before evict_cmd was assigned, so shrinking max_size
-			# between runs raised AttributeError.
-			if self.size > max_size:
-				self.evict(self.size - max_size)
-				self.vacuum()
+		if self.size > self.max_size:  # max_size shrank since the last run
+			self.evict(self.size - self.max_size)
+			self.vacuum()
 
-	def __call__(self, *args, refresh=False, max_age=_UNSET, cache_only=False, **kwargs):
+	def __call__(self, *args, refresh=False, cache_only=False, max_age=_UNSET, **kwargs):
 		if refresh and cache_only:
 			raise ValueError('refresh=True and cache_only=True are contradictory')
 
-		values = self.serialize_input(args, kwargs)
-		# The lookup still runs under refresh: `cached_output is None` is what
-		# tells the size accounting below whether the write adds a row or
-		# replaces one, and skipping it would count every refresh as growth.
-		cached_output = self.get_cached(values)
-		if cached_output is not None and not refresh:
-			*return_values, timestamp = cached_output
-			max_age = self.max_age if max_age is _UNSET else get_age(max_age)
-			# FIX: get_age was applied a second time to an already-converted value.
-			if time.time() - timestamp <= max_age:
-				return self.codec.compose(return_values)
-
+		key = self.encode_key(args, kwargs)
+		# runs even under refresh: whether a row already exists is what tells
+		# the size accounting below if the write adds a row or replaces one
+		cached = self.fetch(key)
+		if cached is not None and not refresh:
+			*outputs, timestamp = cached
+			limit = self.max_age if max_age is _UNSET else as_seconds(max_age)
+			if time.time() - timestamp <= limit:
+				return self.codec.decode(outputs)
 		if cache_only:
 			raise CacheMiss(args, kwargs)
 
 		result = self.func(*args, **kwargs)
-		self.codec.concat(values, result)
-		values.append(int(time.time()))
-		self.conn.execute(self.insert_cmd, values)
-		if cached_output is None:
+		# whole seconds: never later than the real write time, so an entry can
+		# only ever expire a moment early, not late
+		self.conn.execute(self.store_cmd, [*key, *self.codec.encode(result), int(time.time())])
+		if cached is None:
 			self.size += 1
-			if self.size > self.max_size:
-				self.evict(self.evict_batch)
-
+			self.evict(self.size - self.max_size)
 		self.conn.commit()
 		return result
 
+	def encode_key(self, args, kwargs):
+		"""Serialize the arguments of one call, in declared parameter order."""
+		bound = self.signature.bind(*args, **kwargs)
+		bound.apply_defaults()  # also re-sorts keyword arguments into declaration order
+		return [col.serialize(v) for col, v in zip(self.input_columns, bound.arguments.values(), strict=True)]
+
+	def fetch(self, key):
+		"""The stored (outputs..., timestamp) row for a key, or None."""
+		try:
+			return self.conn.execute(self.lookup_cmd, key).fetchone()
+		except sqlite3.OperationalError as e:
+			# only a missing table or column implies the signature moved; locks,
+			# I/O errors and the like pass through untouched
+			if not str(e).startswith(('no such table', 'no such column')):
+				raise
+			cached = self.conn.execute(
+				'SELECT name, type FROM pragma_table_info(?)', (self.table,)).fetchall()
+			raise ValueError(
+				f"{self.table}: the function signature has changed incompatibly\n"
+				f"  cached: {', '.join(f'{name} {tp}' for name, tp in cached) or '(table is missing)'}\n"
+				f"  wanted: {', '.join(f'{col.name} {col.sql_type}' for col in self.columns)}") from e
+
 	def evict(self, count):
-		# LIMIT handles a count past the end on its own -- the subquery just
-		# returns every row -- so only the degenerate case needs guarding.
+		"""Delete the `count` oldest entries."""
 		if count < 1:
 			return
-		cur = self.conn.execute(self.evict_cmd, (count,))
-		self.size -= cur.rowcount
+		self.size -= self.conn.execute(self.evict_cmd, (count,)).rowcount
 
 	def clear(self):
-		super().clear()
+		"""Empty the cache."""
+		self.conn.execute(f"DELETE FROM {self.qtable}")
+		self.conn.commit()
 		self.size = 0
 
 	def contents(self):
+		"""Every stored row, oldest first."""
 		return self.conn.execute(
-			f"SELECT {column_names(self.columns)} "
-			f"FROM {self.qtable} "
-			"ORDER BY timestamp ASC").fetchall()
+			f"SELECT {column_names(self.columns)} FROM {self.qtable} ORDER BY timestamp").fetchall()
+
+	def vacuum(self):
+		"""Give the space freed by deleted entries back to the filesystem."""
+		self.conn.commit()  # VACUUM cannot run inside a transaction
+		self.conn.execute('VACUUM')
+
+	def close(self):
+		self.conn.close()
+
+	def __len__(self):
+		return self.size
 
 
-class CacheMiss(Exception):
-	"""Raised by a cache_only call when there is no cached entry.
+class Codec:
+	"""Converts a return value to one stored value per column and back.
 
-	FIX: `.args` is now (positional_args, keyword_args) rather than the bare
-	positional arguments, since keyword arguments now reach the wrapped function
-	and belong in the report.
+	The value is handled as a sequence of elements: a tuple already is one, a
+	dataclass is taken apart into its fields, and a plain value is a 1-tuple.
 	"""
 
+	def __init__(self, columns, split=tuple, join=tuple):
+		self.columns = columns
+		self.split = split
+		self.join = join
 
-def column_names(columns):
-	return ', '.join(col.quoted for col in columns)
+	def encode(self, value):
+		return [col.serialize(v) for col, v in zip(self.columns, self.split(value), strict=True)]
+
+	def decode(self, values):
+		elements = [col.deserialize(v) for col, v in zip(self.columns, values, strict=True)]
+		return self.join(elements)
 
 
-def identity(x):
-	return x
+def make_codec(return_type):
+	"""Pick the columns and conversions for a return annotation.
+
+	The column names contain `$` or the keyword `return`, neither of which can
+	appear in a parameter name, so they can never collide with an input column.
+	"""
+	if return_type is tuple:
+		raise ValueError('a tuple return type must be parameterized, e.g. tuple[int, str]')
+	if typing.get_origin(return_type) is tuple:
+		return Codec([Column(f'return${i}', tp) for i, tp in enumerate(typing.get_args(return_type))])
+	if is_dataclass(return_type):
+		# resolve the field annotations too; under `from __future__ import
+		# annotations` they are strings
+		hints = typing.get_type_hints(return_type, include_extras=True)
+		return Codec(
+			[Column(f'return${i}', hints[f.name]) for i, f in enumerate(fields(return_type))],
+			split=astuple, join=lambda elements: return_type(*elements))
+	return Codec(
+		[Column('return', return_type)],
+		split=lambda value: (value,), join=lambda elements: elements[0])
 
 
-def to_bool(value):
-	# None passes through so a nullable bool column round-trips as None, not False.
-	return value if value is None else bool(value)
-
-
-SQLITE_TYPES = {
+SQL_TYPES = {
 	bool: 'INTEGER',
 	int: 'INTEGER',
 	float: 'REAL',
@@ -461,187 +297,97 @@ SQLITE_TYPES = {
 
 
 class Column:
+	"""One table column: a name, an SQLite type, and how values pass through.
 
-	def __init__(self, name: str, tp: type):
+	The type is taken from an annotation. `T | None` makes the column nullable.
+	`Annotated[T, (serialize, deserialize)]` passes values through the given
+	functions; the column then stores whatever the serializer's return
+	annotation says. `Annotated[T, serialize]` gives only the one direction,
+	which is allowed on a column that is never read back -- pass read_back=False
+	to say so.
+	"""
+
+	def __init__(self, name, annotation, *, read_back=True):
+		if annotation is _EMPTY:
+			raise ValueError(f"type of {name} must be given")
 		self.name = name
 		self.quoted = quote(name)
-		if tp is _EMPTY:
-			raise ValueError(f"type of {name} must be given")
-		if typing.get_origin(tp) is typing.Annotated:
-			# FIX: get_args was unpacked as exactly two values, so Annotated with
-			# more than one piece of metadata died on an opaque tuple-unpack
-			# error instead of the intended message.
-			_base, *extras = typing.get_args(tp)
-			if len(extras) != 1:
-				raise ValueError(f"expected a single serializer annotation on {name} but got {extras}")
-			meta = extras[0]
-			if callable(meta):
-				self.serialize = meta
-				self.deserialize = identity
-			# FIX: len(meta) raised TypeError for un-sized metadata (an int, say)
-			# instead of falling through to the ValueError below.
-			elif isinstance(meta, tuple) and len(meta) == 2 and all(callable(f) for f in meta):
-				self.serialize, self.deserialize = meta
-			else:
-				raise ValueError(
-					f"type annotation must be a serializer function or a tuple of (serializer, deserializer) but got {meta}")
+		self.serialize = self.deserialize = identity
+		if typing.get_origin(annotation) is typing.Annotated:
+			_base, *extras = typing.get_args(annotation)
+			self.serialize, self.deserialize = read_serializer(name, extras, read_back)
 			try:
-				# FIX: read through get_type_hints for the same reason as above,
-				# and tolerate callables that have no __annotations__ at all.
-				tp = typing.get_type_hints(self.serialize)['return']
+				annotation = typing.get_type_hints(self.serialize)['return']
 			except (KeyError, TypeError, AttributeError):
-				raise ValueError('serializer must have return type')
-		else:
-			self.serialize = identity
-			self.deserialize = identity
-
-		origin = typing.get_origin(tp)
-		if origin is types.UnionType or origin is typing.Union:
-			self.base_type = unwrap_union(tp)
-			self.nullable = True
-		else:
-			self.base_type = tp
-			self.nullable = False
-
+				raise ValueError(f"the serializer for {name} must have a return type") from None
+		base, self.nullable = split_optional(annotation)
 		try:
-			self.sql_type = SQLITE_TYPES[self.base_type]
+			self.sql_type = SQL_TYPES[base]
 		except KeyError:
-			raise ValueError(f"unsupported type: {tp}")
-
-		# FIX: bool stored as INTEGER came back as 0/1, so a cache hit returned
-		# int where the fresh call returned bool. Only applied when the caller
-		# has not supplied a deserializer of their own.
-		if self.base_type is bool and self.deserialize is identity:
-			self.deserialize = to_bool
+			raise ValueError(f"unsupported type: {annotation}") from None
+		if base is bool and self.deserialize is identity:
+			self.deserialize = to_bool  # SQLite hands back 0/1, not False/True
 
 	@property
 	def definition(self):
-		return f"{self.quoted} {self.sql_type}{"" if self.nullable else " NOT NULL"}"
-
-	def __repr__(self):
-		# FIX: __name__ is missing on partials and callable objects.
-		def label(f):
-			return getattr(f, '__name__', repr(f))
-		return f"({self.definition}: >>{label(self.serialize)}, <<{label(self.deserialize)})"
+		return f"{self.quoted} {self.sql_type}" + ("" if self.nullable else " NOT NULL")
 
 
-def unwrap_union(tp: type) -> type:
-	args = typing.get_args(tp)
-	if len(args) == 2:
-		if args[1] is NoneType:
-			return args[0]
-		if args[0] is NoneType:
-			return args[1]
-	raise ValueError(f"Union not allowed except to express nullable type: {tp}")
+def read_serializer(name, extras, read_back):
+	"""The (serialize, deserialize) pair from Annotated metadata.
+
+	A pair converts both ways. A lone function converts only on the way in,
+	which is enough for a column that is never read back, and wrong for one
+	that is -- a cache hit would hand the caller the stored form instead of
+	the value the function actually returned.
+	"""
+	match extras:
+		case [(serialize, deserialize)] if callable(serialize) and callable(deserialize):
+			return serialize, deserialize
+		case [serialize] if callable(serialize):
+			if not read_back:
+				return serialize, identity
+			raise ValueError(
+				f"the annotation on {name} needs both directions: this value is read back "
+				f"on a cache hit, so a lone serializer would return the stored form rather "
+				f"than the real value. Give a (serialize, deserialize) pair.")
+	raise ValueError(
+		f"the annotation on {name} must be a (serialize, deserialize) pair"
+		f"{'' if read_back else ' or a single serializer function'}, got {extras!r}")
 
 
-def get_age(age):
+def split_optional(annotation):
+	"""Split `T | None` into (T, True); no other unions are supported."""
+	if typing.get_origin(annotation) not in (UnionType, typing.Union):
+		return annotation, False
+	rest = set(typing.get_args(annotation)) - {NoneType}
+	if len(rest) == 1:
+		return rest.pop(), True
+	raise ValueError(f"Union not allowed except to express a nullable type: {annotation}")
+
+
+def as_seconds(age):
+	"""A max_age as a number of seconds; None means entries never expire."""
 	if age is None:
-		return sys.maxsize
+		return math.inf
 	if isinstance(age, timedelta):
 		return age.total_seconds()
 	return age
 
 
-def max_local(page_size, rowid):
-	"""Largest record that still fits inside a page, past which rows overflow.
-
-	A rowid table keeps rows in a table b-tree and gets nearly the whole page.
-	A WITHOUT ROWID table keeps them in an *index* b-tree, which reserves far
-	more room for tree structure -- roughly a quarter as much usable space.
-	Assumes no reserved bytes per page, which is the default.
-	"""
-	return (page_size - 35) if rowid else ((page_size - 12) * 64 // 255) - 23
+def quote(identifier):
+	"""Quote an SQL identifier; caller-supplied names must never reach SQL raw."""
+	escaped = identifier.replace('"', '""')
+	return f'"{escaped}"'
 
 
-def varint_len(n):
-	length = 1
-	while n >= 128:
-		n >>= 7
-		length += 1
-	return length
+def column_names(columns):
+	return ', '.join(col.quoted for col in columns)
 
 
-def serial_type(value):
-	"""(serial type, bytes in the record body) for one stored value."""
-	if value is None:
-		return 0, 0
-	if isinstance(value, int):
-		# 0 and 1 have dedicated serial types and occupy no body bytes at all
-		if value == 0:
-			return 8, 0
-		if value == 1:
-			return 9, 0
-		for bits, tp, width in ((8, 1, 1), (16, 2, 2), (24, 3, 3), (32, 4, 4), (48, 5, 6)):
-			if -(1 << (bits - 1)) <= value < (1 << (bits - 1)):
-				return tp, width
-		return 6, 8
-	if isinstance(value, float):
-		return 7, 8
-	if isinstance(value, (bytes, bytearray)):
-		return 12 + 2 * len(value), len(value)
-	if isinstance(value, str):
-		width = len(value.encode())
-		return 13 + 2 * width, width
-	raise TypeError(f"not an SQLite storage class: {value!r}")
+def identity(value):
+	return value
 
 
-def record_size(values):
-	"""Bytes SQLite uses for one record: header varints plus the body."""
-	parts = [serial_type(v) for v in values]
-	body = sum(width for _, width in parts)
-	header = sum(varint_len(tp) for tp, _ in parts)
-	# the header's own length varint counts toward the header, so settle it
-	for extra in (1, 2, 3, 4):
-		if varint_len(header + extra) == extra:
-			header += extra
-			break
-	return header + body
-
-
-@dataclass(frozen=True, slots=True)
-class CacheStats:
-	"""A snapshot of how one cache's rows are sitting on disk."""
-
-	table: str
-	rowid: bool
-	rows: int
-	page_size: int
-	file_bytes: int
-	max_record: int
-	mean_record: int
-	max_local: int
-	sampled: int
-
-	@property
-	def overflowing(self) -> bool:
-		return self.max_record > self.max_local
-
-	@property
-	def headroom(self) -> int:
-		"""Bytes a record may still grow before it starts spilling."""
-		return self.max_local - self.max_record
-
-	def __str__(self):
-		layout = 'rowid' if self.rowid else 'WITHOUT ROWID'
-		note = f" (sampled {self.sampled})" if self.sampled < self.rows else ""
-		lines = [
-			f"{self.table}: {self.rows} rows, {layout}, page_size={self.page_size}",
-			f"  file        {self.file_bytes:,} bytes"
-			f"{f' ({self.file_bytes // self.rows:,}/row)' if self.rows else ''}",
-			f"  record      max {self.max_record}, mean {self.mean_record}{note}",
-			f"  maxLocal    {self.max_local}",
-		]
-		if self.overflowing:
-			spill = self.max_record - self.max_local
-			lines.append(f"  OVERFLOWING -- {spill} bytes spill to an overflow page per row")
-			bigger = next((p for p in (8192, 16384, 32768, 65536)
-			               if max_local(p, self.rowid) >= self.max_record), None)
-			fix = ["rowid=True"] if not self.rowid and max_local(self.page_size, True) >= self.max_record else []
-			if bigger:
-				fix.append(f"page_size={bigger}")
-			if fix:
-				lines.append(f"  try         {' or '.join(fix)}")
-		else:
-			lines.append(f"  headroom    {self.headroom} bytes before rows start overflowing")
-		return "\n".join(lines)
+def to_bool(value):
+	return value if value is None else bool(value)  # None must survive for nullable columns
