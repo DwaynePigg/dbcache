@@ -260,7 +260,12 @@ class Codec:
 		return [col.serialize(v) for col, v in zip(self.columns, self.split(value), strict=True)]
 
 	def decode(self, values):
-		return self.join(col.deserialize(v) for col, v in zip(self.columns, values, strict=True))
+		# A list, not a generator: `join` is free to index it, which is how the
+		# scalar codec below unwraps its one element. It is also the faster of
+		# the two at these lengths -- a generator frame costs more to set up
+		# than a list of three items costs to build.
+		elements = [col.deserialize(v) for col, v in zip(self.columns, values, strict=True)]
+		return self.join(elements)
 
 
 def make_codec(return_type):

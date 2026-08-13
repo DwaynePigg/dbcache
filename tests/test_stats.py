@@ -24,6 +24,57 @@ def test_stats_reports_headroom(db):
 	assert 'headroom' in str(s)
 
 
+def test_stats_record_total_describes_a_real_row(db):
+	"""Summing each column's maximum independently would describe a record that
+	no row actually has: here the widest return$0 and the widest return$1 are in
+	different rows, so the naive total is nearly double the real one."""
+	@database_cache(db)
+	def f(n: int) -> tuple[str, str]:
+		return ('x' * 100, 'y' * 10) if n == 1 else ('x' * 10, 'y' * 100)
+
+	f(1)
+	f(2)
+	s = stats(f)
+	naive = sum(largest for _name, _mean, largest in s.columns)
+	assert naive > 200                  # 100 + 100 + the small columns
+	assert 110 < s.max_record < 130     # either real row: 110 bytes of body plus header
+	assert s.max_record < naive / 1.5
+
+
+def test_stats_counts_the_rows_that_spill(db):
+	"""The number you actually want when a cache is overflowing: how many rows,
+	not just whether the widest one crosses the line."""
+	@database_cache(db)
+	def f(n: int) -> bytes:
+		return bytes(5000 if n % 4 == 0 else 100)
+
+	for i in range(40):
+		f(i)
+	s = stats(f)
+	assert s.overflowing
+	assert s.spilling == 10             # every fourth row, not all 40
+	assert s.rows == 40
+	assert '10 of 40 rows spill' in str(s)
+
+
+def test_stats_shows_a_record_total_line(db):
+	"""The per-column figures do not add up on their own -- the record header is
+	invisible -- so the total is reported rather than left to the reader."""
+	@database_cache(db)
+	def f(n: int) -> str:
+		return 'y' * 900
+
+	f(2)
+	s = stats(f)
+	body = sum(largest for _name, _mean, largest in s.columns)
+	assert s.max_record > body          # the difference is the record header
+	assert s.max_record - body < 16
+	rendered = str(s)
+	assert 'record' in rendered
+	assert f'of {s.page_limit:,}b a page holds' in rendered
+	assert s.headroom == s.page_limit - s.max_record
+
+
 def test_stats_detects_overflow(db):
 	@database_cache(db)
 	def big(x: int) -> bytes:

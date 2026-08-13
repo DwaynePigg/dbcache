@@ -114,31 +114,43 @@ the cliff looks completely normal from the outside. `stats()` shows it:
 ```
 >>> from dbcache import stats
 >>> print(stats(get_products))
-get_products: 300 rows, 630,784 bytes on disk (2102/row)
-  card           mean      3.0b  max       3b
-  finish         mean      0.0b  max       0b
-  offset         mean      0.0b  max       0b
-  return         mean  1,900.0b  max   1,900b
-  timestamp      mean      4.0b  max       4b
-  headroom       2,147b, on a widest record of 1,914b, before rows start spilling to overflow pages
+get_products: 300 rows, 630,784 bytes on disk (2,102/row)
+  card           mean       3.0b  max        3b
+  finish         mean       0.0b  max        0b
+  offset         mean       0.5b  max        1b
+  return         mean   1,610.6b  max    1,900b
+  timestamp      mean       4.0b  max        4b
+  record         mean   1,625.1b  max    1,915b   of 4,061b a page holds
+  headroom       2,146b on the widest row
 ```
+
+Read it bottom-up. The `record` line is the whole row — every column plus the
+type header SQLite puts in front of them, which is why it comes to more than the
+columns above it add up to. `headroom` is how much that widest row could still
+grow before it stops fitting in a page.
 
 Sizes are what SQLite actually stores, not what the values print as: an integer
 takes as many bytes as its magnitude needs, and `0` and `1` have dedicated serial
-types that occupy none at all. The per-column breakdown tells you which column to
-attack when a record is too wide:
+types that occupy none at all — which is why `finish=1` costs nothing. Every
+figure is measured per row and then aggregated, so `record`'s maximum is a row
+that really exists rather than the sum of each column's worst case.
+
+The `mean` column earns its place mainly when a cache is over the line, where it
+separates "one freak row" from "everything". The count says so outright:
 
 ```
-render: 300 rows, 1,392,640 bytes on disk (4642/row)
-  image_id       mean      1.6b  max       2b
-  return         mean  4,200.0b  max   4,200b
-  timestamp      mean      4.0b  max       4b
-  OVERFLOWING    the widest record is 4,211b against a 4,061b limit, so 150b spill to an overflow page
+render: 400 rows, 684,032 bytes on disk (1,710/row)
+  image_id       mean       1.7b  max        2b
+  return         mean   1,536.0b  max    4,200b
+  timestamp      mean       4.0b  max        4b
+  record         mean   1,546.7b  max    4,211b   of 4,061b a page holds
+  OVERFLOWING    104 of 400 rows spill to an overflow page, the widest by 150b
 ```
 
-`CacheStats` exposes `.overflowing`, `.rows`, `.file_bytes`, `.max_record`,
-`.page_limit` and `.columns` alongside that rendering. None of it is part of
-caching — `_stats.py` is a separate module that `_core.py` does not import.
+`CacheStats` exposes `.rows`, `.columns`, `.mean_record`, `.max_record`,
+`.spilling`, `.page_limit`, `.headroom`, `.overflowing` and `.file_bytes`
+alongside that rendering. None of it is part of caching — `_stats.py` is a
+separate module that `_core.py` does not import.
 
 ## Journal mode
 
