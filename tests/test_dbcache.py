@@ -1,9 +1,7 @@
-"""The _core regression suite, ported to _core2.
+"""Tests for _core: the cache itself.
 
-Dropped: stats()/record-size tests, the rowid flag tests, the evict_batch
-tests and the ABC test -- those features were deliberately removed. Eviction
-expectations changed: the cache now never exceeds max_size and evicts exactly
-the overage, not a batch.
+Errors are checked by type and by the data they carry, not by their wording,
+so messages can be rewritten without breaking anything here.
 """
 import sqlite3
 import time
@@ -13,7 +11,7 @@ from typing import Annotated
 
 import pytest
 
-from dbcache._core import CacheMiss, database_cache, make_codec
+from dbcache._core import CacheMiss, SignatureChanged, database_cache, make_codec
 
 
 @pytest.fixture
@@ -266,7 +264,7 @@ def test_nullable_output(db):
 
 
 def test_nullable_input_rejected(db):
-	with pytest.raises(ValueError, match="cannot be nullable"):
+	with pytest.raises(ValueError, match="nullable"):
 		@database_cache(db)
 		def f(x: int | None) -> str:
 			return str(x)
@@ -382,8 +380,12 @@ def test_missing_table_reports_signature_change(db):
 
 	h(1)
 	h.conn.execute('ALTER TABLE "h" RENAME TO "h_old"')
-	with pytest.raises(ValueError, match="signature has changed"):
+	with pytest.raises(SignatureChanged) as exc:
 		h(2)
+
+	assert exc.value.found == []  # an empty `found` is how a missing table reads
+	assert exc.value.expected == [
+		("x", "INTEGER"), ("return", "INTEGER"), ("timestamp", "INTEGER")]
 
 
 def test_changed_return_type_reports_signature_change(db):
@@ -403,8 +405,16 @@ def test_changed_return_type_reports_signature_change(db):
 	def v2(x: int) -> P:
 		return P(1, 2)
 
-	with pytest.raises(ValueError) as exc:
+	with pytest.raises(SignatureChanged) as exc:
 		v2(5)
+
+	# the columns, not the wording -- the message is free to change
+	assert exc.value.table == "f"
+	assert exc.value.found == [
+		("x", "INTEGER"), ("return", "INTEGER"), ("timestamp", "INTEGER")]
+	assert exc.value.expected == [
+		("x", "INTEGER"), ("return$0", "INTEGER"), ("return$1", "INTEGER"),
+		("timestamp", "INTEGER")]
 
 
 def test_renamed_parameter_reports_signature_change(db):
@@ -419,7 +429,49 @@ def test_renamed_parameter_reports_signature_change(db):
 	def v2(y: int) -> int:
 		return y
 
-	with pytest.raises(ValueError, match="signature has changed"):
+	with pytest.raises(SignatureChanged) as exc:
+		v2(5)
+
+	# the stored table still says x; the function now wants y
+	assert [name for name, _type in exc.value.found] == ["x", "return", "timestamp"]
+	assert [name for name, _type in exc.value.expected] == ["y", "return", "timestamp"]
+
+
+def test_a_keyerror_inside_make_codec_is_not_relabelled(db):
+	"""Guarding the return-type lookup with try/except KeyError around the
+	make_codec call swallowed KeyErrors raised inside it -- make_codec indexes
+	hints[field] per dataclass field -- and reported them as a missing return
+	annotation, pointing at the wrong thing entirely."""
+	@dataclass
+	class Tampered:
+		a: int
+		b: str
+
+	del Tampered.__annotations__["b"]  # make_codec's hints[f.name] will now fail
+
+	with pytest.raises(Exception) as exc:
+		@database_cache(db)
+		def f(x: int) -> Tampered:
+			return None
+
+	assert "return type must be given" not in str(exc.value)
+
+
+def test_signature_change_is_catchable_as_a_value_error(db):
+	"""SignatureChanged subclasses ValueError, so code written before it
+	existed still catches it."""
+	@database_cache(db, name="f")
+	def v1(x: int) -> int:
+		return x
+
+	v1(5)
+	v1.close()
+
+	@database_cache(db, name="f")
+	def v2(y: int) -> int:
+		return y
+
+	with pytest.raises(ValueError):
 		v2(5)
 
 
@@ -438,33 +490,33 @@ def test_other_operational_errors_are_not_disguised(db):
 
 
 def test_missing_return_annotation_rejected(db):
-	with pytest.raises(ValueError, match="return type must be given"):
+	with pytest.raises(ValueError, match="return type"):
 		@database_cache(db)
 		def f(x: int):
 			return x
 
 
 def test_missing_parameter_annotation_rejected(db):
-	with pytest.raises(ValueError, match="type of x must be given"):
+	with pytest.raises(ValueError, match="type of x"):
 		@database_cache(db)
 		def f(x) -> int:
 			return x
 
 
 def test_bare_tuple_return_rejected(db):
-	with pytest.raises(ValueError, match="must be parameterized"):
+	with pytest.raises(ValueError, match="parameterized"):
 		@database_cache(db)
 		def f(x: int) -> tuple:
 			return (x,)
 
 
 def test_nonpositive_settings_rejected(db):
-	with pytest.raises(ValueError, match="max_age must be positive"):
+	with pytest.raises(ValueError, match="max_age"):
 		@database_cache(db, max_age=0)
 		def f(x: int) -> int:
 			return x
 
-	with pytest.raises(ValueError, match="max_size must be positive"):
+	with pytest.raises(ValueError, match="max_size"):
 		@database_cache(db, max_size=0)
 		def g(x: int) -> int:
 			return x
@@ -641,7 +693,7 @@ def test_serializer_only_rejected_on_a_return_type(db):
 	def as_text(v: object) -> str:
 		return str(v)
 
-	with pytest.raises(ValueError, match="needs both directions"):
+	with pytest.raises(ValueError, match="directions"):
 		@database_cache(db)
 		def f(n: int) -> Annotated[object, as_text]:
 			return n * 2
@@ -667,14 +719,14 @@ def test_serializer_pair_on_input_is_also_fine(db):
 
 
 def test_annotated_with_too_much_metadata_rejected(db):
-	with pytest.raises(ValueError, match="serialize, deserialize"):
+	with pytest.raises(ValueError, match="deserialize"):
 		@database_cache(db)
 		def f(n: int) -> Annotated[int, to_csv, from_csv]:
 			return n
 
 
 def test_annotated_with_unsized_metadata_rejected(db):
-	with pytest.raises(ValueError, match="serialize, deserialize"):
+	with pytest.raises(ValueError, match="deserialize"):
 		@database_cache(db)
 		def f(n: int) -> Annotated[int, 5]:
 			return n
@@ -683,7 +735,7 @@ def test_annotated_with_unsized_metadata_rejected(db):
 def test_serializer_without_return_type_rejected(db):
 	"""On a parameter, where the one-way form is legal, so this reaches the
 	return-annotation check rather than tripping the pair check first."""
-	with pytest.raises(ValueError, match="must have a return type"):
+	with pytest.raises(ValueError, match="serializer"):
 		@database_cache(db)
 		def f(n: Annotated[int, lambda v: str(v)]) -> int:
 			return 1
@@ -692,14 +744,14 @@ def test_serializer_without_return_type_rejected(db):
 # --- misc ---------------------------------------------------------------------
 
 def test_unsupported_type_rejected(db):
-	with pytest.raises(ValueError, match="unsupported type"):
+	with pytest.raises(ValueError, match="unsupported"):
 		@database_cache(db)
 		def f(x: int) -> complex:
 			return complex(x)
 
 
 def test_non_optional_union_rejected(db):
-	with pytest.raises(ValueError, match="Union not allowed"):
+	with pytest.raises(ValueError, match="Union"):
 		@database_cache(db)
 		def f(x: int) -> int | str:
 			return x

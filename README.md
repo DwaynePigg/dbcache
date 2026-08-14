@@ -197,8 +197,10 @@ calling the function afterwards raises `ProgrammingError`.
 - Two handles on the same table each track their own row count, so `max_size`
   is enforced against a stale number if one cache is opened twice.
 - Changing a function's signature or return type invalidates its table. The
-  mismatch is reported at the first call, naming both the stored and the wanted
-  columns; delete the file to rebuild.
+  first call raises `SignatureChanged`, whose `.found` and `.expected` are both
+  `[(column, SQL type), ...]` — what the table has against what the function
+  wants — so you can rebuild programmatically rather than by reading the
+  message. It subclasses `ValueError`. Delete the file to rebuild by hand.
 - Methods are not supported — `self` has no annotation.
 - Exceptions are not cached.
 

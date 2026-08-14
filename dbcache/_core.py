@@ -60,6 +60,29 @@ class CacheMiss(Exception):
 	"""
 
 
+class SignatureChanged(ValueError):
+	"""The table on disk no longer has the columns the function needs.
+
+	`found` and `expected` are both [(column name, SQL type), ...] -- what the
+	table has, and what the function wants. Catch this to rebuild a stale
+	cache, and read the two lists rather than the message, which is free to
+	change. Empty `found` means the table is not there at all.
+	"""
+
+	def __init__(self, table, found, expected):
+		self.table = table
+		self.found = found
+		self.expected = expected
+		super().__init__(
+			f"{table}: the function signature has changed incompatibly\n"
+			f"  found:    {describe(found) or '(table is missing)'}\n"
+			f"  expected: {describe(expected)}")
+
+
+def describe(columns):
+	return ', '.join(f'{name} {sql_type}' for name, sql_type in columns)
+
+
 class DatabaseCache:
 	"""What database_cache wraps a function in: the table and its statements."""
 
@@ -99,10 +122,12 @@ class DatabaseCache:
 				f"{self.table} has optional parameter(s) {nullable}; parameters form the primary "
 				f"key and cannot be nullable, since SQL NULL never compares equal and a None "
 				f"argument could never hit. Use Annotated to map None onto a real value instead.")
-		try:
-			self.codec = make_codec(hints['return'])
-		except KeyError:
+		# the membership test rather than try/except: make_codec looks up
+		# hints[f.name] per dataclass field, and catching around the call turns
+		# any KeyError from in there into a wrong "return type must be given"
+		if 'return' not in hints:
 			raise ValueError(f"{self.table}: return type must be given")
+		self.codec = make_codec(hints['return'])
 		self.columns = [*self.input_columns, *self.codec.columns, Column('timestamp', int)]
 
 		self.conn = sqlite3.connect(file)
@@ -178,12 +203,11 @@ class DatabaseCache:
 			# I/O errors and the like pass through untouched
 			if not str(e).startswith(('no such table', 'no such column')):
 				raise
-			cached = self.conn.execute(
+			found = self.conn.execute(
 				'SELECT name, type FROM pragma_table_info(?)', (self.table,)).fetchall()
-			raise ValueError(
-				f"{self.table}: the function signature has changed incompatibly\n"
-				f"  found:    {', '.join(f'{name} {tp}' for name, tp in cached) or '(table is missing)'}\n"
-				f"  expected: {', '.join(f'{col.name} {col.sql_type}' for col in self.columns)}") from e
+			raise SignatureChanged(
+				self.table, found,
+				[(col.name, col.sql_type) for col in self.columns]) from e
 
 	def evict(self, count):
 		"""Delete the `count` oldest entries."""
