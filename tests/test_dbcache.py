@@ -843,3 +843,88 @@ def test_per_call_max_age_none_accepts_any_age(db):
 	f.conn.commit()
 	f(1, max_age=None)   # explicitly asking for an entry of any age
 	assert calls == [1, 1]
+
+
+# --- threads ------------------------------------------------------------------
+
+def test_call_from_another_thread(db):
+	"""The connection belongs to whichever thread decorated the function; the
+	calls come from whichever thread does the work."""
+	import threading
+
+	@database_cache(db)
+	def f(x: int) -> int:
+		return x * 2
+
+	f(1)   # warm the table on this thread, the way an import would
+	results, errors = [], []
+	def worker():
+		try:
+			results.append((f(1), f(2)))   # one hit, one miss
+		except Exception as e:
+			errors.append(e)
+	t = threading.Thread(target=worker)
+	t.start()
+	t.join()
+	assert errors == []
+	assert results == [(2, 4)]
+
+
+def test_concurrent_misses_keep_size_exact(db):
+	"""Several threads miss the same key at once: last write wins, but only one
+	of them added a row, and `size` drives eviction, so it has to say so."""
+	import threading
+
+	go = threading.Barrier(8)
+	@database_cache(db, max_size=100)
+	def f(x: int) -> int:
+		go.wait()   # every thread is past the lookup before any of them stores
+		return x * 2
+
+	threads = [threading.Thread(target=f, args=(7,)) for _ in range(8)]
+	for t in threads:
+		t.start()
+	for t in threads:
+		t.join()
+	assert f.size == 1
+	assert len(f.contents()) == 1
+	assert f(7) == 14
+
+
+def test_concurrent_distinct_keys_all_land(db):
+	"""Different keys from different threads: every one stored, size exact,
+	nothing lost to an interleaved commit."""
+	import threading
+
+	@database_cache(db, max_size=1000)
+	def f(x: int) -> int:
+		return x * 2
+
+	def worker(start):
+		for i in range(start, start + 50):
+			f(i)
+	threads = [threading.Thread(target=worker, args=(n * 50,)) for n in range(8)]
+	for t in threads:
+		t.start()
+	for t in threads:
+		t.join()
+	assert f.size == 400
+	assert len(f.contents()) == 400
+	assert all(f(i) == i * 2 for i in range(400))
+
+
+def test_stats_from_another_thread(db):
+	import threading
+	from dbcache import CacheStats
+	from dbcache._stats import stats
+
+	@database_cache(db)
+	def f(x: int) -> int:
+		return x
+	f(1)
+	out = []
+	t = threading.Thread(target=lambda: out.append(stats(f)))
+	t.start()
+	t.join()
+	assert isinstance(out[0], CacheStats)
+	assert out[0].rows == 1

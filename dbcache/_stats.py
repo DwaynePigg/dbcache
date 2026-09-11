@@ -29,11 +29,6 @@ INT_BOUNDS = ((127, 1), (32767, 2), (8388607, 3), (2147483647, 4), (140737488355
 
 def stats(cache):
 	"""Measure one cache: bytes per column, and how near a row is to spilling."""
-	page_size = cache.conn.execute('PRAGMA page_size').fetchone()[0]
-	page_count = cache.conn.execute('PRAGMA page_count').fetchone()[0]
-	# a row lives in the table b-tree, which gets all of the page but its header
-	page_limit = page_size - 35
-
 	# Every figure is measured per row and then aggregated, rather than summing
 	# each column's maximum -- those maxima can come from different rows, so
 	# their sum is an upper bound that may describe no record that exists.
@@ -41,9 +36,17 @@ def stats(cache):
 	record = record_expr(cache.columns, alias)
 	per_column = ', '.join(
 		f"avg({e}), max({e})" for e in (size_expr(c, alias) for c in cache.columns))
-	rows, mean_record, max_record, spilling, max_rowid, *measured = cache.conn.execute(
-		f"SELECT count(*), avg({record}), max({record}), sum({record} > {page_limit}), "
-		f"max(rowid), {per_column} FROM {cache.qtable}").fetchone()
+
+	# One critical section for all three reads, so the figures describe the
+	# same moment rather than straddling a store from another thread.
+	with cache.lock:
+		page_size = cache.conn.execute('PRAGMA page_size').fetchone()[0]
+		page_count = cache.conn.execute('PRAGMA page_count').fetchone()[0]
+		# a row lives in the table b-tree, which gets all of the page but its header
+		page_limit = page_size - 35
+		rows, mean_record, max_record, spilling, max_rowid, *measured = cache.conn.execute(
+			f"SELECT count(*), avg({record}), max({record}), sum({record} > {page_limit}), "
+			f"max(rowid), {per_column} FROM {cache.qtable}").fetchone()
 
 	return CacheStats(
 		table=cache.table,

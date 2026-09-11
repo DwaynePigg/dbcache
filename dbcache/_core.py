@@ -13,6 +13,7 @@ import functools
 import inspect
 import math
 import sqlite3
+import threading
 import time
 import typing
 from dataclasses import astuple, fields, is_dataclass
@@ -130,7 +131,10 @@ class DatabaseCache:
 		self.codec = make_codec(hints['return'])
 		self.columns = [*self.input_columns, *self.codec.columns, Column('timestamp', int)]
 
-		self.conn = sqlite3.connect(file)
+		# One connection for every thread, made safe by the lock rather than by
+		# sqlite3's own-thread check. Reentrant: __call__ evicts while holding it.
+		self.lock = threading.RLock()
+		self.conn = sqlite3.connect(file, check_same_thread=False)
 		# Off, a double-quoted name that matches no column is an error. On (the
 		# legacy default), SQLite reads it as a string literal, which would turn
 		# a missing column into silently wrong data instead of the ValueError
@@ -187,52 +191,64 @@ class DatabaseCache:
 		if cache_only:
 			raise CacheMiss(args, kwargs)
 
+		# Unlocked on purpose: this is the slow part, and holding the lock across
+		# it would queue every caller behind one call to protect a 5us lookup.
 		result = self.func(*args, **kwargs)
-		self.conn.execute(self.store_cmd, [*key, *self.codec.encode(result), int(time.time())])
-		if cached is None:
-			self.size += 1
-			self.evict(self.size - self.max_size)
-		self.conn.commit()
+		with self.lock:
+			# Re-checked here: another thread may have stored this key meanwhile,
+			# and counting a replace as new would put `size` -- hence eviction -- over.
+			new = cached is None and self.conn.execute(self.lookup_cmd, key).fetchone() is None
+			self.conn.execute(self.store_cmd, [*key, *self.codec.encode(result), int(time.time())])
+			if new:
+				self.size += 1
+				self.evict(self.size - self.max_size)
+			self.conn.commit()
 		return result
 
 	def _fetch(self, key):
-		try:
-			return self.conn.execute(self.lookup_cmd, key).fetchone()
-		except sqlite3.OperationalError as e:
-			# only a missing table or column implies the signature moved; locks,
-			# I/O errors and the like pass through untouched
-			if not str(e).startswith(('no such table', 'no such column')):
-				raise
-			found = self.conn.execute(
-				'SELECT name, type FROM pragma_table_info(?)', (self.table,)).fetchall()
-			raise SignatureChanged(
-				self.table, found,
-				[(col.name, col.sql_type) for col in self.columns]) from e
+		with self.lock:
+			try:
+				return self.conn.execute(self.lookup_cmd, key).fetchone()
+			except sqlite3.OperationalError as e:
+				# only a missing table or column implies the signature moved; locks,
+				# I/O errors and the like pass through untouched
+				if not str(e).startswith(('no such table', 'no such column')):
+					raise
+				found = self.conn.execute(
+					'SELECT name, type FROM pragma_table_info(?)', (self.table,)).fetchall()
+				raise SignatureChanged(
+					self.table, found,
+					[(col.name, col.sql_type) for col in self.columns]) from e
 
 	def evict(self, count):
 		"""Delete the `count` oldest entries."""
 		if count < 1:
 			return
-		self.size -= self.conn.execute(self.evict_cmd, (count,)).rowcount
+		with self.lock:
+			self.size -= self.conn.execute(self.evict_cmd, (count,)).rowcount
 
 	def clear(self):
 		"""Empty the cache."""
-		self.conn.execute(f"DELETE FROM {self.qtable}")
-		self.conn.commit()
-		self.size = 0
+		with self.lock:
+			self.conn.execute(f"DELETE FROM {self.qtable}")
+			self.conn.commit()
+			self.size = 0
 
 	def contents(self):
 		"""Every stored row, oldest first."""
-		return self.conn.execute(
-			f"SELECT {column_names(self.columns)} FROM {self.qtable} ORDER BY timestamp").fetchall()
+		with self.lock:
+			return self.conn.execute(
+				f"SELECT {column_names(self.columns)} FROM {self.qtable} ORDER BY timestamp").fetchall()
 
 	def vacuum(self):
 		"""Give the space freed by deleted entries back to the filesystem."""
-		self.conn.commit()  # VACUUM cannot run inside a transaction
-		self.conn.execute('VACUUM')
+		with self.lock:
+			self.conn.commit()  # VACUUM cannot run inside a transaction
+			self.conn.execute('VACUUM')
 
 	def close(self):
-		self.conn.close()
+		with self.lock:
+			self.conn.close()
 
 	def __len__(self):
 		return self.size
